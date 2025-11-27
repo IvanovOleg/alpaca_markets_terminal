@@ -1,0 +1,10 @@
+[package]
+name = "alpaca_markets_terminal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui = { version = "*" }
+alpaca_markets = { path = "../alpaca_markets", features = ["market_data"] }
+tokio = { version = "1.0", features = ["full"] }
+chrono = "0.4"
