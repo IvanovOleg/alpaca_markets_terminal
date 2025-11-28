@@ -255,6 +255,30 @@ impl BarChart {
         .detach();
     }
 
+    fn close_position(&mut self, symbol: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { close_position_sync(symbol) })
+                .await;
+
+            let _ = this.update(cx, |chart, cx| {
+                match result {
+                    Ok(_) => {
+                        println!("✓ Position closed successfully");
+                        // Refresh positions and orders lists
+                        chart.fetch_positions(cx);
+                        chart.fetch_orders(cx);
+                    }
+                    Err(error) => {
+                        eprintln!("✗ Error closing position: {}", error);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     fn submit_order(&mut self, cx: &mut Context<Self>) {
         // Validate inputs
         if self.order_quantity.trim().is_empty() {
@@ -993,7 +1017,7 @@ impl Render for BarChart {
                         div.child(self.render_account_tab())
                     })
                     .when(self.active_footer_tab == FooterTab::Positions, |div| {
-                        div.child(self.render_positions_tab())
+                        div.child(self.render_positions_tab(cx))
                     })
                     .when(self.active_footer_tab == FooterTab::Orders, |div| {
                         div.child(self.render_orders_tab(cx))
@@ -1346,7 +1370,7 @@ impl BarChart {
             ))
     }
 
-    fn render_positions_tab(&self) -> impl IntoElement {
+    fn render_positions_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.positions_loading {
             return div()
                 .flex()
@@ -1434,9 +1458,17 @@ impl BarChart {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(0x8b949e))
                             .child("P&L %"),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Action"),
                     ),
             )
-            .children(self.positions.iter().map(|pos| {
+            .children(self.positions.iter().enumerate().map(|(idx, pos)| {
                 let pl_value = pos.unrealized_pl.parse::<f64>().unwrap_or(0.0);
                 let pl_color = if pl_value > 0.0 {
                     rgb(0x3fb950)
@@ -1500,6 +1532,28 @@ impl BarChart {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(pl_color)
                             .child(format!("{}%", pos.unrealized_plpc)),
+                    )
+                    .child(
+                        div().w(px(80.0)).child(
+                            div()
+                                .id(ElementId::Name(format!("close-position-{}", idx).into()))
+                                .px_3()
+                                .py_1()
+                                .bg(rgb(0xf2cc60))
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(rgb(0x000000))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0xffd700)))
+                                .child("Close")
+                                .on_click({
+                                    let symbol = pos.symbol.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.close_position(symbol.clone(), cx);
+                                    })
+                                }),
+                        ),
                     )
             }))
     }
@@ -2130,6 +2184,32 @@ fn cancel_order_sync(order_id: String) -> Result<(), String> {
         match result {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("Failed to cancel order: {:?}", e)),
+        }
+    })
+}
+
+// Synchronous function to close a position (runs in background thread)
+fn close_position_sync(symbol: String) -> Result<(), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
+
+    rt.block_on(async {
+        let config = match AlpacaConfig::from_env() {
+            Ok(config) => config,
+            Err(e) => {
+                return Err(format!(
+                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
+                    e
+                ));
+            }
+        };
+
+        let client = TradingClient::new(config);
+
+        let result = client.close_position(&symbol, None, None).await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("Failed to close position: {:?}", e)),
         }
     })
 }
