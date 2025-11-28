@@ -1,190 +1,90 @@
+use alpaca_markets::{AlpacaConfig, Bar, MarketDataClient};
+use chrono::{Duration, Utc};
 use gpui::{
     App, Application, Context, FontWeight, IntoElement, Render, Window, WindowOptions, actions,
     div, prelude::*, px, rgb,
 };
 
-actions!(app, [Quit]);
+actions!(app, [Quit, RefreshData]);
 
-struct CandlestickChart {
+struct BarChart {
     symbol: String,
-    bars: Vec<Candlestick>,
+    bars: Vec<Bar>,
+    loading: bool,
+    error: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-struct Candlestick {
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: u64,
-}
-
-impl Candlestick {
-    fn is_bullish(&self) -> bool {
-        self.close >= self.open
-    }
-}
-
-impl CandlestickChart {
-    fn new(_cx: &mut Context<Self>) -> Self {
-        // Create some mock data for testing
-        let mock_bars = vec![
-            Candlestick {
-                open: 150.0,
-                high: 155.0,
-                low: 148.0,
-                close: 153.0,
-                volume: 1000000,
-            },
-            Candlestick {
-                open: 153.0,
-                high: 158.0,
-                low: 152.0,
-                close: 156.0,
-                volume: 1200000,
-            },
-            Candlestick {
-                open: 156.0,
-                high: 160.0,
-                low: 154.0,
-                close: 155.0,
-                volume: 1100000,
-            },
-            Candlestick {
-                open: 155.0,
-                high: 157.0,
-                low: 150.0,
-                close: 151.0,
-                volume: 1300000,
-            },
-            Candlestick {
-                open: 151.0,
-                high: 154.0,
-                low: 149.0,
-                close: 153.0,
-                volume: 1050000,
-            },
-            Candlestick {
-                open: 153.0,
-                high: 159.0,
-                low: 153.0,
-                close: 158.0,
-                volume: 1400000,
-            },
-            Candlestick {
-                open: 158.0,
-                high: 162.0,
-                low: 157.0,
-                close: 161.0,
-                volume: 1500000,
-            },
-            Candlestick {
-                open: 161.0,
-                high: 165.0,
-                low: 160.0,
-                close: 163.0,
-                volume: 1600000,
-            },
-            Candlestick {
-                open: 163.0,
-                high: 164.0,
-                low: 159.0,
-                close: 160.0,
-                volume: 1250000,
-            },
-            Candlestick {
-                open: 160.0,
-                high: 162.0,
-                low: 157.0,
-                close: 159.0,
-                volume: 1150000,
-            },
-            Candlestick {
-                open: 159.0,
-                high: 163.0,
-                low: 158.0,
-                close: 162.0,
-                volume: 1350000,
-            },
-            Candlestick {
-                open: 162.0,
-                high: 168.0,
-                low: 161.0,
-                close: 167.0,
-                volume: 1700000,
-            },
-            Candlestick {
-                open: 167.0,
-                high: 170.0,
-                low: 165.0,
-                close: 168.0,
-                volume: 1800000,
-            },
-            Candlestick {
-                open: 168.0,
-                high: 172.0,
-                low: 167.0,
-                close: 171.0,
-                volume: 1900000,
-            },
-            Candlestick {
-                open: 171.0,
-                high: 173.0,
-                low: 168.0,
-                close: 169.0,
-                volume: 1450000,
-            },
-            Candlestick {
-                open: 169.0,
-                high: 171.0,
-                low: 166.0,
-                close: 167.0,
-                volume: 1350000,
-            },
-            Candlestick {
-                open: 167.0,
-                high: 169.0,
-                low: 164.0,
-                close: 165.0,
-                volume: 1400000,
-            },
-            Candlestick {
-                open: 165.0,
-                high: 167.0,
-                low: 163.0,
-                close: 166.0,
-                volume: 1300000,
-            },
-            Candlestick {
-                open: 166.0,
-                high: 170.0,
-                low: 165.0,
-                close: 169.0,
-                volume: 1550000,
-            },
-            Candlestick {
-                open: 169.0,
-                high: 175.0,
-                low: 168.0,
-                close: 174.0,
-                volume: 2000000,
-            },
-        ];
-
-        Self {
+impl BarChart {
+    fn new(cx: &mut Context<Self>) -> Self {
+        let mut chart = Self {
             symbol: "AAPL".to_string(),
-            bars: mock_bars,
-        }
+            bars: Vec::new(),
+            loading: true,
+            error: None,
+        };
+
+        // Fetch data on startup
+        chart.fetch_bars(cx);
+        chart
+    }
+
+    fn fetch_bars(&mut self, cx: &mut Context<Self>) {
+        self.loading = true;
+        self.error = None;
+        self.bars.clear();
+        cx.notify();
+
+        let symbol = self.symbol.clone();
+
+        // Modern GPUI async pattern with AsyncApp::update()
+        cx.spawn(async move |this, cx| {
+            // Run the blocking API call in a background thread
+            let result = cx
+                .background_executor()
+                .spawn(async move { fetch_bars_sync(&symbol) })
+                .await;
+
+            // Update UI using AsyncApp::update()
+            let _ = this.update(cx, |chart, cx| {
+                match result {
+                    Ok(bars) => {
+                        chart.bars = bars;
+                        chart.error = None;
+                        println!(
+                            "✓ Successfully loaded {} bars for {}",
+                            chart.bars.len(),
+                            chart.symbol
+                        );
+                    }
+                    Err(error) => {
+                        chart.error = Some(error.clone());
+                        chart.bars = generate_mock_data();
+                        eprintln!("✗ Error fetching bars: {}. Using mock data.", error);
+                    }
+                }
+                chart.loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn render_candlesticks(&self) -> impl IntoElement {
         if self.bars.is_empty() {
+            let message = if self.loading {
+                "Loading data from Alpaca Markets...".to_string()
+            } else if let Some(ref error) = self.error {
+                error.clone()
+            } else {
+                "No data available.".to_string()
+            };
+
             return div()
                 .flex()
                 .items_center()
                 .justify_center()
                 .size_full()
-                .child(div().text_color(rgb(0x808080)).child("No data available."));
+                .child(div().text_color(rgb(0x808080)).child(message));
         }
 
         let chart_width = 1200.0_f32;
@@ -195,12 +95,12 @@ impl CandlestickChart {
         let max_price = self
             .bars
             .iter()
-            .map(|c| c.high)
+            .map(|b| b.close)
             .fold(f64::NEG_INFINITY, f64::max);
         let min_price = self
             .bars
             .iter()
-            .map(|c| c.low)
+            .map(|b| b.close)
             .fold(f64::INFINITY, f64::min);
 
         let price_range = max_price - min_price;
@@ -250,27 +150,29 @@ impl CandlestickChart {
                             )
                     }))
                     // Candlesticks
-                    .children(self.bars.iter().enumerate().map(|(i, candle)| {
+                    .children(self.bars.iter().enumerate().map(|(i, bar)| {
                         let x = padding + i as f32 * candle_width;
 
                         // Calculate Y positions (inverted because canvas origin is top-left)
                         let high_y = padding
-                            + ((adjusted_max - candle.high) / adjusted_range) as f32
+                            + ((adjusted_max - bar.high) / adjusted_range) as f32
                                 * (chart_height - 2.0 * padding);
                         let low_y = padding
-                            + ((adjusted_max - candle.low) / adjusted_range) as f32
+                            + ((adjusted_max - bar.low) / adjusted_range) as f32
                                 * (chart_height - 2.0 * padding);
                         let open_y = padding
-                            + ((adjusted_max - candle.open) / adjusted_range) as f32
+                            + ((adjusted_max - bar.open) / adjusted_range) as f32
                                 * (chart_height - 2.0 * padding);
                         let close_y = padding
-                            + ((adjusted_max - candle.close) / adjusted_range) as f32
+                            + ((adjusted_max - bar.close) / adjusted_range) as f32
                                 * (chart_height - 2.0 * padding);
 
                         let body_top = open_y.min(close_y);
                         let body_height = (open_y - close_y).abs().max(1.0);
 
-                        let (color, fill_color) = if candle.is_bullish() {
+                        // Determine if bullish or bearish
+                        let is_bullish = bar.close >= bar.open;
+                        let (color, fill_color) = if is_bullish {
                             (rgb(0x00cc66), rgb(0x00cc66))
                         } else {
                             (rgb(0xff4444), rgb(0xff4444))
@@ -314,13 +216,15 @@ impl CandlestickChart {
                     .child(div().child(format!("Range: ${:.2}", price_range)))
                     .child(div().child(format!("Bars: {}", self.bars.len())))
                     .when_some(self.bars.last(), |this, last_bar| {
+                        let is_bullish = last_bar.close >= last_bar.open;
+                        let color = if is_bullish {
+                            rgb(0x00cc66)
+                        } else {
+                            rgb(0xff4444)
+                        };
                         this.child(
                             div()
-                                .text_color(if last_bar.is_bullish() {
-                                    rgb(0x00cc66)
-                                } else {
-                                    rgb(0xff4444)
-                                })
+                                .text_color(color)
                                 .child(format!("Last Close: ${:.2}", last_bar.close)),
                         )
                     }),
@@ -328,8 +232,8 @@ impl CandlestickChart {
     }
 }
 
-impl Render for CandlestickChart {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+impl Render for BarChart {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
@@ -359,8 +263,28 @@ impl Render for CandlestickChart {
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x808080))
-                                    .child("Candlestick chart demonstration"),
+                                    .child("Daily candlestick chart powered by Alpaca Markets"),
                             ),
+                    )
+                    .child(
+                        div()
+                            .id("refresh-button")
+                            .px_6()
+                            .py_3()
+                            .bg(rgb(0x238636))
+                            .rounded_lg()
+                            .text_color(rgb(0xffffff))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x2ea043)))
+                            .child(if self.loading {
+                                "⟳ Loading..."
+                            } else {
+                                "↻ Refresh Data"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.fetch_bars(cx);
+                            })),
                     ),
             )
             .child(
@@ -408,7 +332,7 @@ impl Render for CandlestickChart {
                                             .bg(rgb(0x00cc66))
                                             .rounded_sm(),
                                     )
-                                    .child("Green = Bullish (Close > Open)"),
+                                    .child("Green = Bullish (Close ≥ Open)"),
                             )
                             .child(
                                 div()
@@ -431,10 +355,77 @@ impl Render for CandlestickChart {
                         div()
                             .text_xs()
                             .text_color(rgb(0x8b949e))
-                            .child("💡 This is a demonstration with mock data. To use live Alpaca Markets data, set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables."),
+                            .child("💡 Set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables to fetch live data from Alpaca Markets."),
                     ),
             )
     }
+}
+
+// Synchronous function to fetch bars (runs in background thread)
+fn fetch_bars_sync(symbol: &str) -> Result<Vec<Bar>, String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
+
+    rt.block_on(async {
+        // Load configuration from environment
+        let config = match AlpacaConfig::from_env() {
+            Ok(config) => config.with_iex_feed(),
+            Err(e) => {
+                return Err(format!(
+                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
+                    e
+                ));
+            }
+        };
+
+        let client = MarketDataClient::new(config);
+
+        // Fetch last 100 bars of 1-day data
+        let end_time = Utc::now();
+        let start_time = end_time - Duration::days(200);
+
+        let result = client
+            .get_bars(symbol, "1Day", Some(start_time), Some(end_time), Some(100))
+            .await;
+
+        match result {
+            Ok(bars_response) => Ok(bars_response.bars),
+            Err(e) => Err(format!("Error fetching data: {:?}", e)),
+        }
+    })
+}
+
+// Generate mock data for demonstration
+fn generate_mock_data() -> Vec<Bar> {
+    let mut bars = Vec::new();
+    let base_price = 150.0;
+    let start_time = Utc::now() - Duration::days(50);
+
+    for i in 0..50 {
+        let variation = ((i as f64 * 0.5).sin() * 10.0) + ((i as f64 * 0.1).cos() * 5.0);
+        let base = base_price + variation + (i as f64 * 0.2);
+
+        // Generate OHLC values
+        let open = base + ((i as f64 * 0.3).sin() * 2.0);
+        let high = base.max(open) + (i as f64 * 0.1).abs() + 1.0;
+        let low = base.min(open) - (i as f64 * 0.15).abs() - 1.0;
+        let close = base;
+
+        let volume = 50_000_000 + (i * 1_000_000) as u64;
+        let timestamp = start_time + Duration::days(i as i64);
+
+        bars.push(Bar {
+            timestamp,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            trade_count: Some(10000 + i as u64 * 100),
+            vwap: Some((high + low + close) / 3.0),
+        });
+    }
+
+    bars
 }
 
 fn main() {
@@ -442,9 +433,7 @@ fn main() {
         cx.activate(true);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
-        cx.open_window(WindowOptions::default(), |_, cx| {
-            cx.new(CandlestickChart::new)
-        })
-        .unwrap();
+        cx.open_window(WindowOptions::default(), |_, cx| cx.new(BarChart::new))
+            .unwrap();
     });
 }
