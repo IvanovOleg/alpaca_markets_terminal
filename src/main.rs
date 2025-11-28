@@ -1,4 +1,7 @@
-use alpaca_markets::{AlpacaConfig, Bar, MarketDataClient, TradingClient};
+use alpaca_markets::{
+    AlpacaConfig, Bar, MarketDataClient, TradingClient,
+    models::{OrderSide, OrderTimeInForce, OrderType},
+};
 use chrono::{Duration, Utc};
 use gpui::{
     App, Application, Context, ElementId, FocusHandle, FontWeight, IntoElement, Render, Window,
@@ -61,6 +64,17 @@ struct BarChart {
     orders: Vec<Order>,
     orders_loading: bool,
     active_footer_tab: FooterTab,
+    // Order form fields
+    order_side: OrderSide,
+    order_type: OrderType,
+    order_quantity: String,
+    order_limit_price: String,
+    order_time_in_force: OrderTimeInForce,
+    order_submitting: bool,
+    order_message: Option<String>,
+    // Input focus tracking
+    quantity_focused: bool,
+    price_focused: bool,
 }
 
 impl BarChart {
@@ -86,6 +100,15 @@ impl BarChart {
             orders: Vec::new(),
             orders_loading: true,
             active_footer_tab: FooterTab::Account,
+            order_side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            order_quantity: "".to_string(),
+            order_limit_price: "".to_string(),
+            order_time_in_force: OrderTimeInForce::Day,
+            order_submitting: false,
+            order_message: None,
+            quantity_focused: false,
+            price_focused: false,
         };
 
         // Fetch data on startup
@@ -203,6 +226,91 @@ impl BarChart {
                     }
                 }
                 chart.orders_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn submit_order(&mut self, cx: &mut Context<Self>) {
+        // Validate inputs
+        if self.order_quantity.trim().is_empty() {
+            self.order_message = Some("Error: Quantity cannot be empty".to_string());
+            cx.notify();
+            return;
+        }
+
+        let qty = match self.order_quantity.parse::<f64>() {
+            Ok(q) if q > 0.0 => q,
+            _ => {
+                self.order_message = Some("Error: Invalid quantity".to_string());
+                cx.notify();
+                return;
+            }
+        };
+
+        if matches!(self.order_type, OrderType::Limit) && self.order_limit_price.trim().is_empty() {
+            self.order_message = Some("Error: Limit price required for limit orders".to_string());
+            cx.notify();
+            return;
+        }
+
+        let limit_price = if matches!(self.order_type, OrderType::Limit) {
+            match self.order_limit_price.parse::<f64>() {
+                Ok(p) if p > 0.0 => Some(p),
+                _ => {
+                    self.order_message = Some("Error: Invalid limit price".to_string());
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        self.order_submitting = true;
+        self.order_message = None;
+        cx.notify();
+
+        let symbol = self.symbol.clone();
+        let side = match self.order_side {
+            OrderSide::Buy => OrderSide::Buy,
+            OrderSide::Sell => OrderSide::Sell,
+        };
+        let order_type = match self.order_type {
+            OrderType::Market => OrderType::Market,
+            OrderType::Limit => OrderType::Limit,
+            _ => OrderType::Market,
+        };
+        let time_in_force = match self.order_time_in_force {
+            OrderTimeInForce::Day => OrderTimeInForce::Day,
+            OrderTimeInForce::Gtc => OrderTimeInForce::Gtc,
+            _ => OrderTimeInForce::Day,
+        };
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    submit_order_sync(symbol, side, order_type, qty, limit_price, time_in_force)
+                })
+                .await;
+
+            let _ = this.update(cx, |chart, cx| {
+                match result {
+                    Ok(order_id) => {
+                        chart.order_message =
+                            Some(format!("✓ Order submitted successfully! ID: {}", order_id));
+                        chart.order_quantity = "".to_string();
+                        chart.order_limit_price = "".to_string();
+                        // Refresh orders list
+                        chart.fetch_orders(cx);
+                    }
+                    Err(error) => {
+                        chart.order_message = Some(format!("✗ Error: {}", error));
+                    }
+                }
+                chart.order_submitting = false;
                 cx.notify();
             });
         })
@@ -429,31 +537,79 @@ impl Render for BarChart {
 
         div()
             .flex()
-            .flex_col()
             .bg(rgb(0x0d1117))
             .size_full()
-            .p_8()
-            .gap_6()
+            .child(
+                // Main content area
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .p_8()
+                    .gap_6()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if !this.input_focused {
+                // Handle symbol input
+                if this.input_focused {
+                    let key = event.keystroke.key.as_str();
+
+                    if key == "enter" {
+                        this.submit_symbol(cx);
+                    } else if key == "backspace" {
+                        this.handle_backspace(cx);
+                    } else if key == "escape" {
+                        this.input_focused = false;
+                        cx.notify();
+                    } else if let Some(key_char) = &event.keystroke.key_char {
+                        if key_char.len() == 1 && key_char.chars().all(|c| c.is_alphanumeric()) {
+                            this.handle_input(key_char, cx);
+                        }
+                    }
                     return;
                 }
 
-                let key = event.keystroke.key.as_str();
+                // Handle quantity input
+                if this.quantity_focused {
+                    let key = event.keystroke.key.as_str();
 
-                if key == "enter" {
-                    this.submit_symbol(cx);
-                } else if key == "backspace" {
-                    this.handle_backspace(cx);
-                } else if key == "escape" {
-                    this.input_focused = false;
-                    cx.notify();
-                } else if let Some(key_char) = &event.keystroke.key_char {
-                    // Use key_char for actual character input (handles shift + letter for uppercase)
-                    if key_char.len() == 1 && key_char.chars().all(|c| c.is_alphanumeric()) {
-                        this.handle_input(key_char, cx);
+                    if key == "enter" {
+                        this.quantity_focused = false;
+                        cx.notify();
+                    } else if key == "backspace" {
+                        this.order_quantity.pop();
+                        cx.notify();
+                    } else if key == "escape" {
+                        this.quantity_focused = false;
+                        cx.notify();
+                    } else if let Some(key_char) = &event.keystroke.key_char {
+                        if key_char.len() == 1 && (key_char.chars().all(|c| c.is_numeric()) || key_char == ".") {
+                            this.order_quantity.push_str(key_char);
+                            cx.notify();
+                        }
                     }
+                    return;
+                }
+
+                // Handle price input
+                if this.price_focused {
+                    let key = event.keystroke.key.as_str();
+
+                    if key == "enter" {
+                        this.price_focused = false;
+                        cx.notify();
+                    } else if key == "backspace" {
+                        this.order_limit_price.pop();
+                        cx.notify();
+                    } else if key == "escape" {
+                        this.price_focused = false;
+                        cx.notify();
+                    } else if let Some(key_char) = &event.keystroke.key_char {
+                        if key_char.len() == 1 && (key_char.chars().all(|c| c.is_numeric()) || key_char == ".") {
+                            this.order_limit_price.push_str(key_char);
+                            cx.notify();
+                        }
+                    }
+                    return;
                 }
             }))
             .child(
@@ -819,6 +975,304 @@ impl Render for BarChart {
                     .when(self.active_footer_tab == FooterTab::Orders, |div| {
                         div.child(self.render_orders_tab())
                     }),
+            )
+            )
+            .child(
+                // Right sidebar - Order form
+                div()
+                    .w(px(320.0))
+                    .h_full()
+                    .bg(rgb(0x161b22))
+                    .border_l_1()
+                    .border_color(rgb(0x30363d))
+                    .p_6()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(0xffffff))
+                            .child("Place Order"),
+                            )
+                            .child(
+                                // Current symbol display
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(0xffffff))
+                                            .child("Trading Symbol"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .py_2()
+                                            .bg(rgb(0x0d1117))
+                                            .border_1()
+                                            .border_color(rgb(0x1f6feb))
+                                            .rounded_md()
+                                            .text_color(rgb(0x58a6ff))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(self.symbol.clone()),
+                                    ),
+                            )
+                            .child(
+                        // Order side (Buy/Sell)
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .child("Side"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("order-side-buy")
+                                            .flex_1()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .text_center()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .bg(if matches!(self.order_side, OrderSide::Buy) {
+                                                rgb(0x238636)
+                                            } else {
+                                                rgb(0x21262d)
+                                            })
+                                            .text_color(rgb(0xffffff))
+                                            .hover(|style| {
+                                                if matches!(self.order_side, OrderSide::Buy) {
+                                                    style.bg(rgb(0x2ea043))
+                                                } else {
+                                                    style.bg(rgb(0x30363d))
+                                                }
+                                            })
+                                            .child("Buy")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.order_side = OrderSide::Buy;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("order-side-sell")
+                                            .flex_1()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .text_center()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .bg(if matches!(self.order_side, OrderSide::Sell) {
+                                                rgb(0xda3633)
+                                            } else {
+                                                rgb(0x21262d)
+                                            })
+                                            .text_color(rgb(0xffffff))
+                                            .hover(|style| {
+                                                if matches!(self.order_side, OrderSide::Sell) {
+                                                    style.bg(rgb(0xff4444))
+                                                } else {
+                                                    style.bg(rgb(0x30363d))
+                                                }
+                                            })
+                                            .child("Sell")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.order_side = OrderSide::Sell;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        // Order type (Market/Limit)
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .child("Order Type"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("order-type-market")
+                                            .flex_1()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .text_center()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .bg(if matches!(self.order_type, OrderType::Market) {
+                                                rgb(0x1f6feb)
+                                            } else {
+                                                rgb(0x21262d)
+                                            })
+                                            .text_color(rgb(0xffffff))
+                                            .hover(|style| {
+                                                if matches!(self.order_type, OrderType::Market) {
+                                                    style.bg(rgb(0x388bfd))
+                                                } else {
+                                                    style.bg(rgb(0x30363d))
+                                                }
+                                            })
+                                            .child("Market")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.order_type = OrderType::Market;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("order-type-limit")
+                                            .flex_1()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .text_center()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .bg(if matches!(self.order_type, OrderType::Limit) {
+                                                rgb(0x1f6feb)
+                                            } else {
+                                                rgb(0x21262d)
+                                            })
+                                            .text_color(rgb(0xffffff))
+                                            .hover(|style| {
+                                                if matches!(self.order_type, OrderType::Limit) {
+                                                    style.bg(rgb(0x388bfd))
+                                                } else {
+                                                    style.bg(rgb(0x30363d))
+                                                }
+                                            })
+                                            .child("Limit")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.order_type = OrderType::Limit;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        // Quantity input
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .child("Quantity"),
+                            )
+                            .child(
+                                div()
+                                    .id("order-quantity-input")
+                                    .px_3()
+                                    .py_2()
+                                    .bg(if self.quantity_focused {
+                                        rgb(0x1f2937)
+                                    } else {
+                                        rgb(0x0d1117)
+                                    })
+                                    .border_1()
+                                    .border_color(if self.quantity_focused {
+                                        rgb(0x1f6feb)
+                                    } else {
+                                        rgb(0x30363d)
+                                    })
+                                    .rounded_md()
+                                    .text_color(rgb(0xffffff))
+                                    .cursor_text()
+                                    .child(if self.quantity_focused {
+                                        format!("{}|", self.order_quantity)
+                                    } else if self.order_quantity.is_empty() {
+                                        "Enter quantity...".to_string()
+                                    } else {
+                                        self.order_quantity.clone()
+                                    })
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.quantity_focused = true;
+                                        this.input_focused = false;
+                                        this.price_focused = false;
+                                        _window.focus(&this.focus_handle);
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        // Limit price input (shown only for limit orders)
+                        self.render_limit_price_input(cx)
+                    )
+                    .child(
+                        // Time in Force (shown only for limit orders)
+                        self.render_time_in_force(cx)
+                    )
+                    .child(
+                        // Submit button
+                        div()
+                            .id("submit-order-button")
+                            .px_4()
+                            .py_3()
+                            .mt_4()
+                            .bg(if matches!(self.order_side, OrderSide::Buy) {
+                                rgb(0x238636)
+                            } else {
+                                rgb(0xda3633)
+                            })
+                            .rounded_md()
+                            .text_center()
+                            .text_color(rgb(0xffffff))
+                            .font_weight(FontWeight::BOLD)
+                            .cursor_pointer()
+                            .hover(|style| {
+                                if matches!(self.order_side, OrderSide::Buy) {
+                                    style.bg(rgb(0x2ea043))
+                                } else {
+                                    style.bg(rgb(0xff4444))
+                                }
+                            })
+                            .child(if self.order_submitting {
+                                "Submitting...".to_string()
+                            } else {
+                                format!("{} {}",
+                                    if matches!(self.order_side, OrderSide::Buy) { "Buy" } else { "Sell" },
+                                    self.symbol
+                                )
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if !this.order_submitting {
+                                    this.submit_order(cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        self.render_order_message(cx)
+                    )
             )
     }
 }
@@ -1189,6 +1643,164 @@ impl BarChart {
             }))
     }
 
+    fn render_limit_price_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if !matches!(self.order_type, OrderType::Limit) {
+            return div();
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xffffff))
+                    .child("Limit Price"),
+            )
+            .child(
+                div()
+                    .id("order-limit-price-input")
+                    .px_3()
+                    .py_2()
+                    .bg(if self.price_focused {
+                        rgb(0x1f2937)
+                    } else {
+                        rgb(0x0d1117)
+                    })
+                    .border_1()
+                    .border_color(if self.price_focused {
+                        rgb(0x1f6feb)
+                    } else {
+                        rgb(0x30363d)
+                    })
+                    .rounded_md()
+                    .text_color(rgb(0xffffff))
+                    .cursor_text()
+                    .child(if self.price_focused {
+                        format!("{}|", self.order_limit_price)
+                    } else if self.order_limit_price.is_empty() {
+                        "Enter price...".to_string()
+                    } else {
+                        format!("${}", self.order_limit_price)
+                    })
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.price_focused = true;
+                        this.input_focused = false;
+                        this.quantity_focused = false;
+                        _window.focus(&this.focus_handle);
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn render_time_in_force(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if !matches!(self.order_type, OrderType::Limit) {
+            return div();
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xffffff))
+                    .child("Time in Force"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("tif-day-btn")
+                            .flex_1()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .text_center()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .bg(
+                                if matches!(self.order_time_in_force, OrderTimeInForce::Day) {
+                                    rgb(0x1f6feb)
+                                } else {
+                                    rgb(0x21262d)
+                                },
+                            )
+                            .text_color(rgb(0xffffff))
+                            .hover(|style| {
+                                if matches!(self.order_time_in_force, OrderTimeInForce::Day) {
+                                    style.bg(rgb(0x388bfd))
+                                } else {
+                                    style.bg(rgb(0x30363d))
+                                }
+                            })
+                            .child("Day")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.order_time_in_force = OrderTimeInForce::Day;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("tif-gtc-btn")
+                            .flex_1()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .text_center()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .bg(
+                                if matches!(self.order_time_in_force, OrderTimeInForce::Gtc) {
+                                    rgb(0x1f6feb)
+                                } else {
+                                    rgb(0x21262d)
+                                },
+                            )
+                            .text_color(rgb(0xffffff))
+                            .hover(|style| {
+                                if matches!(self.order_time_in_force, OrderTimeInForce::Gtc) {
+                                    style.bg(rgb(0x388bfd))
+                                } else {
+                                    style.bg(rgb(0x30363d))
+                                }
+                            })
+                            .child("GTC")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.order_time_in_force = OrderTimeInForce::Gtc;
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
+    fn render_order_message(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        if self.order_message.is_none() {
+            return div();
+        }
+
+        div()
+            .px_3()
+            .py_2()
+            .bg(rgb(0x21262d))
+            .border_1()
+            .border_color(rgb(0x30363d))
+            .rounded_md()
+            .text_xs()
+            .text_color(if self.order_message.as_ref().unwrap().starts_with("✓") {
+                rgb(0x3fb950)
+            } else {
+                rgb(0xff4444)
+            })
+            .child(self.order_message.clone().unwrap())
+    }
+
     fn render_account_stat(
         &self,
         label: String,
@@ -1386,6 +1998,59 @@ fn fetch_orders_sync() -> Result<Vec<Order>, String> {
                 Ok(mapped_orders)
             }
             Err(e) => Err(format!("Error fetching orders: {:?}", e)),
+        }
+    })
+}
+
+// Synchronous function to submit an order (runs in background thread)
+fn submit_order_sync(
+    symbol: String,
+    side: OrderSide,
+    order_type: OrderType,
+    qty: f64,
+    limit_price: Option<f64>,
+    time_in_force: OrderTimeInForce,
+) -> Result<String, String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
+
+    rt.block_on(async {
+        let config = match AlpacaConfig::from_env() {
+            Ok(config) => config,
+            Err(e) => {
+                return Err(format!(
+                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
+                    e
+                ));
+            }
+        };
+
+        let client = TradingClient::new(config);
+
+        use alpaca_markets::models::OrderRequest;
+
+        let order_request = OrderRequest {
+            symbol: symbol.clone(),
+            qty: Some(qty.to_string()),
+            notional: None,
+            side,
+            order_type,
+            time_in_force,
+            limit_price: limit_price.map(|p| p.to_string()),
+            stop_price: None,
+            extended_hours: Some(false),
+            client_order_id: None,
+            order_class: None,
+            take_profit: None,
+            stop_loss: None,
+            trail_price: None,
+            trail_percent: None,
+        };
+
+        let result = client.submit_order(order_request).await;
+
+        match result {
+            Ok(order) => Ok(order.id),
+            Err(e) => Err(format!("Failed to submit order: {:?}", e)),
         }
     })
 }
