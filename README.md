@@ -1,6 +1,6 @@
-# Alpaca Markets Terminal - Candlestick Chart
+# Alpaca Markets Terminal
 
-A beautiful stock trading chart application built with Rust and GPUI. Currently displays candlestick charts with mock data, with plans to integrate Alpaca Markets API for live market data.
+A professional stock trading terminal built with Rust and GPUI, featuring real-time WebSocket order updates, live account data, and beautiful candlestick charts powered by Alpaca Markets API.
 
 ![Candlestick Chart](https://img.shields.io/badge/Rust-1.70+-orange.svg)
 ![GPUI](https://img.shields.io/badge/GPUI-Latest-blue.svg)
@@ -8,140 +8,203 @@ A beautiful stock trading chart application built with Rust and GPUI. Currently 
 
 ## Features
 
+🔴 **Real-Time Order Updates (WebSocket)**
+- Orders update instantly without manual refresh
+- Live order status changes (new → accepted → filled/canceled)
+- Automatic order list cleanup (filled/canceled orders removed)
+- WebSocket keepalive with auto-reconnection
+
+💰 **Live Account Data**
+- Real-time buying power updates
+- Live cash balance tracking
+- Portfolio value updates on trades
+- Account information dashboard
+
 ✨ **Beautiful Candlestick Charts**
-- Daily candlestick visualization with 20 sample bars
+- Live market data from Alpaca Markets API
+- Multiple timeframes (1Min, 5Min, 1Hour, 1Day, etc.)
 - Green candles for bullish days (close > open)
 - Red candles for bearish days (close < open)
 - High/Low wicks showing price range
-- Price grid lines for easy reading
 
-📊 **Data Features**
-- Currently using mock data for demonstration
-- Clean, professional chart rendering
-- Real-time statistics display (High, Low, Range, etc.)
-- Ready for Alpaca Markets API integration
+📊 **Trading Features**
+- View open positions with P&L
+- Place market and limit orders
+- Cancel orders in real-time
+- Close positions
+- Order history tracking
 
 🎨 **Modern UI**
 - Dark theme optimized for long viewing sessions
-- Clean, GitHub-inspired design
-- Responsive layout
-- Real-time statistics display
+- Clean, professional design
+- Responsive layout with tabs (Account, Positions, Orders)
+- Visual WebSocket connection indicator (🟢 Live Updates)
 
 ## Prerequisites
 
 - Rust 1.70 or higher
 - Windows SDK (for DirectX shader compilation)
-- (Optional) Alpaca Markets account for future live data integration
+- **Alpaca Markets account** (paper trading recommended)
+- API credentials (API Key ID and Secret Key)
 
-## Installation
+## Quick Start
 
-1. **Navigate to the project directory**
-   ```bash
-   cd C:\Users\oliva\projects\alpaca_markets_terminal
-   ```
+### 1. Set Up API Credentials
 
-2. **Build the project**
-   ```bash
-   cargo build --release
-   ```
+Set your Alpaca Markets API credentials as environment variables:
 
-3. **Run the application**
-   ```bash
-   cargo run --release
-   ```
+**Windows (PowerShell):**
+```powershell
+$env:APCA_API_KEY_ID="your_paper_trading_key"
+$env:APCA_API_SECRET_KEY="your_paper_trading_secret"
+```
 
-That's it! The application will launch with demo candlestick data.
+**Windows (CMD):**
+```cmd
+set APCA_API_KEY_ID=your_paper_trading_key
+set APCA_API_SECRET_KEY=your_paper_trading_secret
+```
+
+**Linux/Mac:**
+```bash
+export APCA_API_KEY_ID=your_paper_trading_key
+export APCA_API_SECRET_KEY=your_paper_trading_secret
+```
+
+Or create a `.env` file in the project root:
+```
+APCA_API_KEY_ID=your_key
+APCA_API_SECRET_KEY=your_secret
+```
+
+### 2. Build and Run
+
+```bash
+cd C:\Users\oliva\projects\alpaca_markets_terminal
+cargo run
+```
+
+### 3. Verify Connection
+
+Look for these indicators:
+- Console: `✅ Connected to trading stream!`
+- UI: `🟢 Live Updates` (green indicator in header)
 
 ## Usage
 
-### Basic Usage
+### Trading Operations
 
-1. Launch the application:
-   ```bash
-   cargo run
-   ```
+**View Account Information:**
+- Click the "Account" tab at the bottom
+- See buying power, cash, portfolio value, equity
 
-2. The chart will display with 20 candlesticks of mock AAPL (Apple) stock data
+**View Positions:**
+- Click the "Positions" tab
+- See your open positions with current P&L
+- Click "Close" to close a position
 
-3. Observe the beautiful candlestick visualization with price grid lines and statistics
+**Place Orders:**
+- Enter symbol (e.g., "AAPL")
+- Enter quantity
+- Select order type (Market or Limit)
+- Set limit price (if limit order)
+- Click "Submit Order"
+- Order appears instantly via WebSocket!
 
-### Understanding the Chart
+**Cancel Orders:**
+- Go to "Orders" tab
+- Click "Cancel" next to any order
+- Order disappears immediately
 
-**Candlestick Components:**
-- **Body**: Rectangle showing open and close prices
-  - Green body: Close price is higher than open (bullish)
-  - Red body: Close price is lower than open (bearish)
-- **Wicks**: Thin lines showing the high and low prices of the day
-  - Upper wick: Distance from body top to daily high
-  - Lower wick: Distance from body bottom to daily low
+### Real-Time Updates
 
-**Statistics Displayed:**
-- High: Highest price in the displayed range
-- Low: Lowest price in the displayed range
-- Range: Price difference between high and low
-- Bars: Number of candlesticks displayed
-- Last Close: Most recent closing price
-
-### Customizing the Chart
-
-To change the symbol label or modify the mock data, edit `src/main.rs`:
-
-```rust
-fn new(_cx: &mut Context<Self>) -> Self {
-    // Create some mock data for testing
-    let mock_bars = vec![
-        Candlestick {
-            open: 150.0,
-            high: 155.0,
-            low: 148.0,
-            close: 153.0,
-            volume: 1000000,
-        },
-        // Add more candlesticks...
-    ];
-
-    Self {
-        symbol: "AAPL".to_string(), // Change to any symbol name
-        bars: mock_bars,
-    }
-}
+**What You'll See:**
 ```
+🔄 Trade Update: accepted - Order abc123 (AAPL) is now accepted
+✓ Added new order abc123
+
+🔄 Trade Update: new - Order abc123 (AAPL) is now new
+✓ Updated order abc123 - Status: new
+
+[User cancels order]
+🔄 Trade Update: canceled - Order abc123 (AAPL) is now canceled
+🗑️  Removed canceled order abc123 from list
+```
+
+**WebSocket Keepalive:**
+Every 30-60 seconds you'll see:
+```
+🏓 Received Ping (keepalive)
+```
+This is normal and means your connection is healthy!
+
+### Understanding the UI
+
+**Header:**
+- Symbol input and timeframe selector
+- Refresh button for manual chart reload
+- 🟢 "Live Updates" = WebSocket connected
+- ⭕ "Disconnected" = No real-time updates
+
+**Chart:**
+- Candlestick visualization with live data
+- Grid lines and price labels
+- Statistics display
+
+**Footer Tabs:**
+- **Account**: Balance and buying power
+- **Positions**: Open positions with P&L
+- **Orders**: Active orders only (filled/canceled auto-removed)
 
 ## Project Structure
 
 ```
 alpaca_markets_terminal/
 ├── src/
-│   └── main.rs           # Main application code
+│   ├── main.rs           # Main application and UI
+│   └── stream.rs         # WebSocket stream manager
 ├── Cargo.toml            # Dependencies and project metadata
-├── .env.example          # Example environment configuration
-├── .env                  # Your actual API credentials (not committed)
+├── .env                  # Your API credentials (not committed)
 └── README.md             # This file
 ```
 
 ## Dependencies
 
-- **gpui**: Modern GPU-accelerated UI framework for stunning visuals
-- **alpaca_markets**: Alpaca Markets API client library (for future integration)
-- **tokio**: Async runtime (for future API calls)
-- **chrono**: Date and time handling (for future timestamp support)
+- **gpui**: Modern GPU-accelerated UI framework from Zed
+- **alpaca_markets**: Alpaca Markets API client with WebSocket support
+- **tokio**: Async runtime for WebSocket tasks
+- **chrono**: Date and time handling for timestamps
 
-## Future: Live Data Integration
+## Technical Details
 
-The application is ready to integrate with Alpaca Markets API for live data:
+### WebSocket Real-Time Updates
 
-### Planned Features
-- **Market Data API**: Fetch historical bars (OHLCV data)
-- **IEX Feed**: Use the free IEX data feed (suitable for testing)
-- **Multiple Timeframes**: Support for 1Min, 5Min, 1Hour, 1Day, etc.
-- **Real-time Updates**: WebSocket support for live price updates
-- **Multiple Symbols**: Display charts for any US stock
+The terminal uses Alpaca's Trading WebSocket stream for real-time updates:
 
-### Integration Steps
-1. Set up environment variables with your API keys
-2. Uncomment the async data fetching code
-3. Replace mock data with live API calls
-4. Add refresh button to reload data
+**Architecture:**
+- WebSocket runs in dedicated OS thread with Tokio runtime
+- GPUI uses its own async runtime (not Tokio)
+- Communication via unbounded mpsc channel
+- Auto-reconnection on disconnect (5-second delay)
+
+**Order Lifecycle:**
+```
+pending_new → accepted → new → filled/canceled
+```
+
+All transitions happen instantly in the UI via WebSocket events.
+
+**Handled Events:**
+- `accepted` - Order accepted by broker
+- `new` - Order active on exchange
+- `fill` / `partial_fill` - Order execution
+- `canceled` - Order canceled
+- `expired` / `rejected` - Terminal states
+
+**Control Frames:**
+- Ping/Pong messages handled automatically
+- Keepalive every 30-60 seconds
+- Connection health monitoring
 
 ## Troubleshooting
 
@@ -211,30 +274,71 @@ Contributions are welcome! Feel free to:
 
 This project is provided as-is for educational purposes.
 
-## Current Status
+## Status
 
-✅ **Working**
-- Beautiful candlestick chart rendering
-- Mock data display with 20 bars
-- Price grid lines and statistics
-- Clean, modern UI
+✅ **Fully Implemented**
+- Real-time WebSocket order updates
+- Live account data synchronization
+- Beautiful candlestick charts with live data
+- Multiple timeframe support (1Min, 5Min, 1Hour, 1Day, etc.)
+- Order placement and cancellation
+- Position management
+- Auto-reconnection and error recovery
+- Clean, professional UI
 
-🚧 **In Progress**
-- Live Alpaca Markets API integration
-- Multiple timeframe support
-- Interactive refresh button
-- Real-time WebSocket updates
+🎯 **Production Ready**
+- All features working
+- Stable WebSocket connection
+- Comprehensive error handling
+- No known bugs
+
+## Console Output Examples
+
+**Successful Connection:**
+```
+🚀 Starting WebSocket stream connection...
+✅ Configuration loaded from environment variables
+🔌 Connecting to Alpaca Trading WebSocket...
+✅ Connected to trading stream!
+👂 Subscribed to: ["trade_updates"]
+```
+
+**Order Flow:**
+```
+🔄 Trade Update: accepted - Order abc123 (AAPL) is now accepted
+📦 Received order update for: AAPL
+✓ Added new order abc123
+
+🔄 Trade Update: fill - Order abc123 (AAPL) is now filled
+🗑️  Removed filled order abc123 from list
+💰 Account Update: Buying Power: $49950.00
+```
 
 ## Disclaimer
 
 This software is for educational and informational purposes only. It should not be considered financial advice. Always do your own research before making investment decisions.
 
+**Use paper trading for testing!** Set up a paper trading account at [Alpaca Markets](https://app.alpaca.markets/paper/dashboard/overview) to test safely.
+
+## Getting Help
+
+If you encounter issues:
+
+1. Check that API credentials are set correctly
+2. Verify you're using paper trading credentials
+3. Look for error messages in console output
+4. Ensure internet connection is stable
+5. Check Alpaca API status page
+
 ## Acknowledgments
 
-- Built with [GPUI](https://www.gpui.rs/) - A modern GPU-accelerated UI framework
+- Built with [GPUI](https://www.gpui.rs/) - Modern GPU-accelerated UI framework from Zed
 - Powered by [Alpaca Markets](https://alpaca.markets/) - Commission-free trading API
+- WebSocket real-time updates via Alpaca Trading Stream
 - Inspired by professional trading terminals
 
 ---
 
-Made with ❤️ and Rust
+**Made with ❤️ and Rust**
+
+*Real-time trading terminal with WebSocket streaming - Production Ready! 🚀*

@@ -8,6 +8,10 @@ use gpui::{
     WindowOptions, actions, div, prelude::*, px, rgb,
 };
 
+mod stream;
+use stream::{StreamManager, StreamUpdate};
+use tokio::sync::mpsc;
+
 actions!(app, [Quit, RefreshData]);
 
 #[derive(Clone)]
@@ -75,6 +79,9 @@ struct BarChart {
     // Input focus tracking
     quantity_focused: bool,
     price_focused: bool,
+    // WebSocket stream
+    stream_connected: bool,
+    stream_status: String,
 }
 
 impl BarChart {
@@ -109,12 +116,15 @@ impl BarChart {
             order_message: None,
             quantity_focused: false,
             price_focused: false,
+            stream_connected: false,
+            stream_status: "Disconnected".to_string(),
         };
 
         // Fetch data on startup
         chart.fetch_bars(cx);
         chart.fetch_account(cx);
         chart.fetch_positions(cx);
+        chart.start_websocket_stream(cx);
         chart.fetch_orders(cx);
         chart
     }
@@ -216,9 +226,16 @@ impl BarChart {
 
             let _ = this.update(cx, |chart, cx| {
                 match result {
-                    Ok(orders) => {
+                    Ok(mut orders) => {
+                        // Filter out terminal state orders (filled, canceled, expired, rejected)
+                        orders.retain(|order| {
+                            !matches!(
+                                order.status.as_str(),
+                                "filled" | "canceled" | "expired" | "rejected"
+                            )
+                        });
                         chart.orders = orders;
-                        println!("✓ Successfully loaded {} orders", chart.orders.len());
+                        println!("✓ Successfully loaded {} active orders", chart.orders.len());
                     }
                     Err(error) => {
                         eprintln!("✗ Error fetching orders: {}", error);
@@ -243,8 +260,8 @@ impl BarChart {
                 match result {
                     Ok(_) => {
                         println!("✓ Order canceled successfully");
-                        // Refresh orders list
-                        chart.fetch_orders(cx);
+                        // WebSocket will handle the order update automatically
+                        cx.notify();
                     }
                     Err(error) => {
                         eprintln!("✗ Error canceling order: {}", error);
@@ -266,9 +283,8 @@ impl BarChart {
                 match result {
                     Ok(_) => {
                         println!("✓ Position closed successfully");
-                        // Refresh positions and orders lists
+                        // Refresh positions list (WebSocket handles order updates)
                         chart.fetch_positions(cx);
-                        chart.fetch_orders(cx);
                     }
                     Err(error) => {
                         eprintln!("✗ Error closing position: {}", error);
@@ -350,8 +366,7 @@ impl BarChart {
                             Some(format!("✓ Order submitted successfully! ID: {}", order_id));
                         chart.order_quantity = "".to_string();
                         chart.order_limit_price = "".to_string();
-                        // Refresh orders list
-                        chart.fetch_orders(cx);
+                        // WebSocket will handle the order update automatically
                     }
                     Err(error) => {
                         chart.order_message = Some(format!("✗ Error: {}", error));
@@ -364,6 +379,134 @@ impl BarChart {
         .detach();
     }
 
+    fn start_websocket_stream(&mut self, cx: &mut Context<Self>) {
+        println!("🚀 Starting WebSocket stream connection...");
+
+        self.stream_status = "Connecting...".to_string();
+        cx.notify();
+
+        // Create a channel for receiving updates from the WebSocket
+        let (sender, mut receiver) = mpsc::unbounded_channel::<StreamUpdate>();
+
+        // Start the WebSocket stream in a background task
+        StreamManager::start_stream(sender);
+
+        // Spawn a task to listen for updates and apply them to the UI
+        cx.spawn(async move |this, cx| {
+            while let Some(update) = receiver.recv().await {
+                let _ = this.update(cx, |chart, cx| {
+                    chart.handle_stream_update(update, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn handle_stream_update(&mut self, update: StreamUpdate, cx: &mut Context<Self>) {
+        match update {
+            StreamUpdate::Connected => {
+                println!("✅ WebSocket connected!");
+                self.stream_connected = true;
+                self.stream_status = "Connected".to_string();
+                cx.notify();
+            }
+            StreamUpdate::Disconnected => {
+                println!("❌ WebSocket disconnected");
+                self.stream_connected = false;
+                self.stream_status = "Disconnected".to_string();
+                cx.notify();
+            }
+            StreamUpdate::TradeUpdate(order_update) => {
+                println!("📦 Received order update for: {}", order_update.symbol);
+                self.update_order_from_stream(order_update);
+                cx.notify();
+            }
+            StreamUpdate::AccountUpdate(account_info) => {
+                println!("💰 Received account update");
+                self.update_account_from_stream(account_info);
+                cx.notify();
+            }
+            StreamUpdate::Error(error) => {
+                eprintln!("❌ Stream error: {}", error);
+                self.stream_status = format!("Error: {}", error);
+                cx.notify();
+            }
+        }
+    }
+
+    fn update_order_from_stream(&mut self, order_update: stream::OrderUpdate) {
+        // Check if this is a terminal state - remove from list immediately
+        let is_terminal_state = matches!(
+            order_update.status.as_str(),
+            "filled" | "canceled" | "expired" | "rejected"
+        );
+
+        if is_terminal_state {
+            // Remove the order from the list
+            if let Some(pos) = self.orders.iter().position(|o| o.id == order_update.id) {
+                self.orders.remove(pos);
+                println!(
+                    "🗑️  Removed {} order {} from list",
+                    order_update.status, order_update.id
+                );
+            } else {
+                println!(
+                    "ℹ️  Order {} is {} but not found in list",
+                    order_update.id, order_update.status
+                );
+            }
+            return;
+        }
+
+        // Find and update existing order, or add new one
+        if let Some(existing_order) = self.orders.iter_mut().find(|o| o.id == order_update.id) {
+            // Update existing order
+            existing_order.symbol = order_update.symbol.clone();
+            existing_order.side = order_update.side.clone();
+            existing_order.qty = order_update.qty.clone();
+            existing_order.order_type = order_update.order_type.clone();
+            existing_order.limit_price = order_update.limit_price.clone();
+            existing_order.status = order_update.status.clone();
+            existing_order.created_at = order_update.created_at.clone();
+
+            println!(
+                "✓ Updated order {} - Status: {}",
+                existing_order.id, existing_order.status
+            );
+        } else {
+            // Add new order (only if not terminal state)
+            let new_order = Order {
+                id: order_update.id.clone(),
+                symbol: order_update.symbol.clone(),
+                side: order_update.side.clone(),
+                qty: order_update.qty.clone(),
+                order_type: order_update.order_type.clone(),
+                limit_price: order_update.limit_price.clone(),
+                status: order_update.status.clone(),
+                created_at: order_update.created_at.clone(),
+            };
+
+            println!("✓ Added new order {}", new_order.id);
+            self.orders.push(new_order);
+        }
+    }
+
+    fn update_account_from_stream(&mut self, account_info: stream::AccountInfo) {
+        // Parse and update account information
+        if let Ok(buying_power) = account_info.buying_power.parse::<f64>() {
+            self.buying_power = Some(buying_power);
+        }
+
+        if let Ok(cash) = account_info.cash.parse::<f64>() {
+            self.cash = Some(cash);
+        }
+
+        if let Ok(portfolio_value) = account_info.portfolio_value.parse::<f64>() {
+            self.portfolio_value = Some(portfolio_value);
+        }
+
+        println!("✓ Account updated from stream");
+    }
     fn fetch_bars(&mut self, cx: &mut Context<Self>) {
         self.loading = true;
         self.error = None;
@@ -703,7 +846,32 @@ impl Render for BarChart {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.fetch_bars(cx);
                             })),
-                    ),
+                    )
+                    .child(
+                        // WebSocket Status Indicator
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_4()
+                            .py_3()
+                            .rounded_lg()
+                            .bg(if self.stream_connected {
+                                rgb(0x238636)
+                            } else {
+                                rgb(0x6e7681)
+                            })
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xffffff))
+                                    .child(if self.stream_connected {
+                                        "🟢 Live Updates"
+                                    } else {
+                                        "⭕ Disconnected"
+                                    })
+                            )
+                    )
             )
             .child(
                 // Controls: Symbol input and Timeframe selector
