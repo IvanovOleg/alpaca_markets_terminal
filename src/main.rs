@@ -7,6 +7,36 @@ use gpui::{
 
 actions!(app, [Quit, RefreshData]);
 
+#[derive(Clone)]
+struct Position {
+    symbol: String,
+    qty: String,
+    avg_entry_price: String,
+    current_price: String,
+    market_value: String,
+    unrealized_pl: String,
+    unrealized_plpc: String,
+}
+
+#[derive(Clone)]
+struct Order {
+    id: String,
+    symbol: String,
+    side: String,
+    qty: String,
+    order_type: String,
+    limit_price: Option<String>,
+    status: String,
+    created_at: String,
+}
+
+#[derive(Clone, PartialEq)]
+enum FooterTab {
+    Account,
+    Positions,
+    Orders,
+}
+
 struct BarChart {
     symbol: String,
     symbol_input: String,
@@ -24,6 +54,13 @@ struct BarChart {
     portfolio_value: Option<f64>,
     equity: Option<f64>,
     account_loading: bool,
+    // Positions information
+    positions: Vec<Position>,
+    positions_loading: bool,
+    // Orders information
+    orders: Vec<Order>,
+    orders_loading: bool,
+    active_footer_tab: FooterTab,
 }
 
 impl BarChart {
@@ -44,11 +81,18 @@ impl BarChart {
             portfolio_value: None,
             equity: None,
             account_loading: true,
+            positions: Vec::new(),
+            positions_loading: true,
+            orders: Vec::new(),
+            orders_loading: true,
+            active_footer_tab: FooterTab::Account,
         };
 
         // Fetch data on startup
         chart.fetch_bars(cx);
         chart.fetch_account(cx);
+        chart.fetch_positions(cx);
+        chart.fetch_orders(cx);
         chart
     }
 
@@ -103,6 +147,62 @@ impl BarChart {
                     }
                 }
                 chart.account_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn fetch_positions(&mut self, cx: &mut Context<Self>) {
+        self.positions_loading = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { fetch_positions_sync() })
+                .await;
+
+            let _ = this.update(cx, |chart, cx| {
+                match result {
+                    Ok(positions) => {
+                        chart.positions = positions;
+                        println!("✓ Successfully loaded {} positions", chart.positions.len());
+                    }
+                    Err(error) => {
+                        eprintln!("✗ Error fetching positions: {}", error);
+                        chart.positions.clear();
+                    }
+                }
+                chart.positions_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn fetch_orders(&mut self, cx: &mut Context<Self>) {
+        self.orders_loading = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { fetch_orders_sync() })
+                .await;
+
+            let _ = this.update(cx, |chart, cx| {
+                match result {
+                    Ok(orders) => {
+                        chart.orders = orders;
+                        println!("✓ Successfully loaded {} orders", chart.orders.len());
+                    }
+                    Err(error) => {
+                        eprintln!("✗ Error fetching orders: {}", error);
+                        chart.orders.clear();
+                    }
+                }
+                chart.orders_loading = false;
                 cx.notify();
             });
         })
@@ -577,7 +677,7 @@ impl Render for BarChart {
                     ),
             )
             .child(
-                // Account Information Footer
+                // Tabbed Footer
                 div()
                     .flex()
                     .flex_col()
@@ -588,20 +688,103 @@ impl Render for BarChart {
                     .border_1()
                     .border_color(rgb(0x30363d))
                     .child(
+                        // Tab buttons and refresh button
                         div()
                             .flex()
                             .items_center()
                             .justify_between()
                             .child(
                                 div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xffffff))
-                                    .child("Trading Account Information"),
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("tab-account")
+                                            .px_4()
+                                            .py_2()
+                                            .rounded_md()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .bg(if self.active_footer_tab == FooterTab::Account {
+                                                rgb(0x238636)
+                                            } else {
+                                                rgb(0x21262d)
+                                            })
+                                            .text_color(rgb(0xffffff))
+                                            .hover(|style| {
+                                                if self.active_footer_tab == FooterTab::Account {
+                                                    style.bg(rgb(0x2ea043))
+                                                } else {
+                                                    style.bg(rgb(0x30363d))
+                                                }
+                                            })
+                                            .child("Account Information")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.active_footer_tab = FooterTab::Account;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("tab-positions")
+                                            .px_4()
+                                            .py_2()
+                                            .rounded_md()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .bg(if self.active_footer_tab == FooterTab::Positions {
+                                                rgb(0x238636)
+                                            } else {
+                                                rgb(0x21262d)
+                                            })
+                                            .text_color(rgb(0xffffff))
+                                            .hover(|style| {
+                                                if self.active_footer_tab == FooterTab::Positions {
+                                                    style.bg(rgb(0x2ea043))
+                                                } else {
+                                                    style.bg(rgb(0x30363d))
+                                                }
+                                            })
+                                            .child("Active Positions")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.active_footer_tab = FooterTab::Positions;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("tab-orders")
+                                            .px_4()
+                                            .py_2()
+                                            .rounded_md()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .bg(if self.active_footer_tab == FooterTab::Orders {
+                                                rgb(0x238636)
+                                            } else {
+                                                rgb(0x21262d)
+                                            })
+                                            .text_color(rgb(0xffffff))
+                                            .hover(|style| {
+                                                if self.active_footer_tab == FooterTab::Orders {
+                                                    style.bg(rgb(0x2ea043))
+                                                } else {
+                                                    style.bg(rgb(0x30363d))
+                                                }
+                                            })
+                                            .child("Active Orders")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.active_footer_tab = FooterTab::Orders;
+                                                cx.notify();
+                                            })),
+                                    ),
                             )
                             .child(
                                 div()
-                                    .id("refresh-account-button")
+                                    .id("refresh-footer-button")
                                     .px_3()
                                     .py_1()
                                     .bg(rgb(0x238636))
@@ -611,57 +794,401 @@ impl Render for BarChart {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x2ea043)))
-                                    .child(if self.account_loading {
+                                    .child(if (self.active_footer_tab == FooterTab::Account && self.account_loading)
+                                        || (self.active_footer_tab == FooterTab::Positions && self.positions_loading)
+                                        || (self.active_footer_tab == FooterTab::Orders && self.orders_loading) {
                                         "⟳ Loading..."
                                     } else {
                                         "↻ Refresh"
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.fetch_account(cx);
+                                        match this.active_footer_tab {
+                                            FooterTab::Account => this.fetch_account(cx),
+                                            FooterTab::Positions => this.fetch_positions(cx),
+                                            FooterTab::Orders => this.fetch_orders(cx),
+                                        }
                                     })),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_6()
-                            .text_sm()
-                            .child(
-                                self.render_account_stat("Account Number".to_string(),
-                                    self.account_number.clone().unwrap_or("Loading...".to_string()),
-                                    rgb(0xa371f7))
-                            )
-                            .child(
-                                self.render_account_stat("Account Status".to_string(),
-                                    self.account_status.clone().unwrap_or("Loading...".to_string()),
-                                    rgb(0x58a6ff))
-                            )
-                            .child(
-                                self.render_account_stat("Portfolio Value".to_string(),
-                                    format!("${:.2}", self.portfolio_value.unwrap_or(0.0)),
-                                    rgb(0x3fb950))
-                            )
-                            .child(
-                                self.render_account_stat("Equity".to_string(),
-                                    format!("${:.2}", self.equity.unwrap_or(0.0)),
-                                    rgb(0x3fb950))
-                            )
-                            .child(
-                                self.render_account_stat("Cash".to_string(),
-                                    format!("${:.2}", self.cash.unwrap_or(0.0)),
-                                    rgb(0xf2cc60))
-                            )
-                            .child(
-                                self.render_account_stat("Buying Power".to_string(),
-                                    format!("${:.2}", self.buying_power.unwrap_or(0.0)),
-                                    rgb(0xf2cc60))
-                            ),
-                    ),
+                    .when(self.active_footer_tab == FooterTab::Account, |div| {
+                        div.child(self.render_account_tab())
+                    })
+                    .when(self.active_footer_tab == FooterTab::Positions, |div| {
+                        div.child(self.render_positions_tab())
+                    })
+                    .when(self.active_footer_tab == FooterTab::Orders, |div| {
+                        div.child(self.render_orders_tab())
+                    }),
             )
     }
 }
 
 impl BarChart {
+    fn render_account_tab(&self) -> impl IntoElement {
+        div()
+            .flex()
+            .gap_6()
+            .text_sm()
+            .child(
+                self.render_account_stat(
+                    "Account Number".to_string(),
+                    self.account_number
+                        .clone()
+                        .unwrap_or("Loading...".to_string()),
+                    rgb(0xa371f7),
+                ),
+            )
+            .child(
+                self.render_account_stat(
+                    "Account Status".to_string(),
+                    self.account_status
+                        .clone()
+                        .unwrap_or("Loading...".to_string()),
+                    rgb(0x58a6ff),
+                ),
+            )
+            .child(self.render_account_stat(
+                "Portfolio Value".to_string(),
+                format!("${:.2}", self.portfolio_value.unwrap_or(0.0)),
+                rgb(0x3fb950),
+            ))
+            .child(self.render_account_stat(
+                "Equity".to_string(),
+                format!("${:.2}", self.equity.unwrap_or(0.0)),
+                rgb(0x3fb950),
+            ))
+            .child(self.render_account_stat(
+                "Cash".to_string(),
+                format!("${:.2}", self.cash.unwrap_or(0.0)),
+                rgb(0xf2cc60),
+            ))
+            .child(self.render_account_stat(
+                "Buying Power".to_string(),
+                format!("${:.2}", self.buying_power.unwrap_or(0.0)),
+                rgb(0xf2cc60),
+            ))
+    }
+
+    fn render_positions_tab(&self) -> impl IntoElement {
+        if self.positions_loading {
+            return div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .text_color(rgb(0x8b949e))
+                .child("Loading positions...");
+        }
+
+        if self.positions.is_empty() {
+            return div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .text_color(rgb(0x8b949e))
+                .child("No active positions");
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                // Table header
+                div()
+                    .flex()
+                    .gap_4()
+                    .pb_2()
+                    .border_b_1()
+                    .border_color(rgb(0x30363d))
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Symbol"),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Qty"),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Avg Entry"),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Current"),
+                    )
+                    .child(
+                        div()
+                            .w(px(120.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Market Value"),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("P&L"),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("P&L %"),
+                    ),
+            )
+            .children(self.positions.iter().map(|pos| {
+                let pl_value = pos.unrealized_pl.parse::<f64>().unwrap_or(0.0);
+                let pl_color = if pl_value > 0.0 {
+                    rgb(0x3fb950)
+                } else if pl_value < 0.0 {
+                    rgb(0xff4444)
+                } else {
+                    rgb(0x8b949e)
+                };
+
+                div()
+                    .flex()
+                    .gap_4()
+                    .py_2()
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_sm()
+                            .text_color(rgb(0xffffff))
+                            .child(pos.symbol.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_sm()
+                            .text_color(rgb(0x8b949e))
+                            .child(pos.qty.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .text_sm()
+                            .text_color(rgb(0x8b949e))
+                            .child(format!("${}", pos.avg_entry_price)),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .text_sm()
+                            .text_color(rgb(0x8b949e))
+                            .child(format!("${}", pos.current_price)),
+                    )
+                    .child(
+                        div()
+                            .w(px(120.0))
+                            .text_sm()
+                            .text_color(rgb(0xffffff))
+                            .child(format!("${}", pos.market_value)),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(pl_color)
+                            .child(format!("${}", pos.unrealized_pl)),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(pl_color)
+                            .child(format!("{}%", pos.unrealized_plpc)),
+                    )
+            }))
+    }
+
+    fn render_orders_tab(&self) -> impl IntoElement {
+        if self.orders_loading {
+            return div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .text_color(rgb(0x8b949e))
+                .child("Loading orders...");
+        }
+
+        if self.orders.is_empty() {
+            return div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .text_color(rgb(0x8b949e))
+                .child("No active orders");
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                // Table header
+                div()
+                    .flex()
+                    .gap_4()
+                    .pb_2()
+                    .border_b_1()
+                    .border_color(rgb(0x30363d))
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Symbol"),
+                    )
+                    .child(
+                        div()
+                            .w(px(60.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Side"),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Qty"),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Type"),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Limit Price"),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Status"),
+                    )
+                    .child(
+                        div()
+                            .w(px(150.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Created At"),
+                    ),
+            )
+            .children(self.orders.iter().map(|order| {
+                let side_color = if order.side.to_lowercase().contains("buy") {
+                    rgb(0x3fb950)
+                } else {
+                    rgb(0xff4444)
+                };
+
+                let status_color = match order.status.to_lowercase().as_str() {
+                    s if s.contains("filled") => rgb(0x3fb950),
+                    s if s.contains("canceled") || s.contains("rejected") => rgb(0xff4444),
+                    s if s.contains("pending") => rgb(0xf2cc60),
+                    _ => rgb(0x58a6ff),
+                };
+
+                div()
+                    .flex()
+                    .gap_4()
+                    .py_2()
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_sm()
+                            .text_color(rgb(0xffffff))
+                            .child(order.symbol.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(60.0))
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(side_color)
+                            .child(order.side.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_sm()
+                            .text_color(rgb(0x8b949e))
+                            .child(order.qty.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_sm()
+                            .text_color(rgb(0x8b949e))
+                            .child(order.order_type.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .text_sm()
+                            .text_color(rgb(0x8b949e))
+                            .child(order.limit_price.clone().unwrap_or("-".to_string())),
+                    )
+                    .child(
+                        div()
+                            .w(px(100.0))
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(status_color)
+                            .child(order.status.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(150.0))
+                            .text_sm()
+                            .text_color(rgb(0x8b949e))
+                            .child(order.created_at.clone()),
+                    )
+            }))
+    }
+
     fn render_account_stat(
         &self,
         label: String,
@@ -777,6 +1304,88 @@ fn fetch_account_sync() -> Result<(String, String, f64, f64, f64, f64), String> 
                 ))
             },
             Err(e) => Err(format!("Error fetching account: {:?}", e)),
+        }
+    })
+}
+
+// Synchronous function to fetch positions (runs in background thread)
+fn fetch_positions_sync() -> Result<Vec<Position>, String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
+
+    rt.block_on(async {
+        let config = match AlpacaConfig::from_env() {
+            Ok(config) => config,
+            Err(e) => {
+                return Err(format!(
+                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
+                    e
+                ));
+            }
+        };
+
+        let client = TradingClient::new(config);
+
+        let result = client.get_positions().await;
+
+        match result {
+            Ok(positions) => {
+                let mapped_positions = positions
+                    .into_iter()
+                    .map(|p| Position {
+                        symbol: p.symbol,
+                        qty: p.qty,
+                        avg_entry_price: p.avg_entry_price,
+                        current_price: p.current_price,
+                        market_value: p.market_value,
+                        unrealized_pl: p.unrealized_pl,
+                        unrealized_plpc: p.unrealized_plpc,
+                    })
+                    .collect();
+                Ok(mapped_positions)
+            }
+            Err(e) => Err(format!("Error fetching positions: {:?}", e)),
+        }
+    })
+}
+
+// Synchronous function to fetch orders (runs in background thread)
+fn fetch_orders_sync() -> Result<Vec<Order>, String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
+
+    rt.block_on(async {
+        let config = match AlpacaConfig::from_env() {
+            Ok(config) => config,
+            Err(e) => {
+                return Err(format!(
+                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
+                    e
+                ));
+            }
+        };
+
+        let client = TradingClient::new(config);
+
+        // Get open orders (status="open")
+        let result = client.get_orders(Some("open"), Some(50)).await;
+
+        match result {
+            Ok(orders) => {
+                let mapped_orders = orders
+                    .into_iter()
+                    .map(|o| Order {
+                        id: o.id,
+                        symbol: o.symbol,
+                        side: format!("{:?}", o.side),
+                        qty: o.qty.unwrap_or("0".to_string()),
+                        order_type: format!("{:?}", o.order_type),
+                        limit_price: o.limit_price,
+                        status: format!("{:?}", o.status),
+                        created_at: o.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                    })
+                    .collect();
+                Ok(mapped_orders)
+            }
+            Err(e) => Err(format!("Error fetching orders: {:?}", e)),
         }
     })
 }
