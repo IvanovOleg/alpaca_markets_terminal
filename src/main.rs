@@ -232,6 +232,29 @@ impl BarChart {
         .detach();
     }
 
+    fn cancel_order(&mut self, order_id: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { cancel_order_sync(order_id) })
+                .await;
+
+            let _ = this.update(cx, |chart, cx| {
+                match result {
+                    Ok(_) => {
+                        println!("✓ Order canceled successfully");
+                        // Refresh orders list
+                        chart.fetch_orders(cx);
+                    }
+                    Err(error) => {
+                        eprintln!("✗ Error canceling order: {}", error);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     fn submit_order(&mut self, cx: &mut Context<Self>) {
         // Validate inputs
         if self.order_quantity.trim().is_empty() {
@@ -973,7 +996,7 @@ impl Render for BarChart {
                         div.child(self.render_positions_tab())
                     })
                     .when(self.active_footer_tab == FooterTab::Orders, |div| {
-                        div.child(self.render_orders_tab())
+                        div.child(self.render_orders_tab(cx))
                     }),
             )
             )
@@ -1481,7 +1504,7 @@ impl BarChart {
             }))
     }
 
-    fn render_orders_tab(&self) -> impl IntoElement {
+    fn render_orders_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.orders_loading {
             return div()
                 .flex()
@@ -1569,9 +1592,17 @@ impl BarChart {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(0x8b949e))
                             .child("Created At"),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8b949e))
+                            .child("Action"),
                     ),
             )
-            .children(self.orders.iter().map(|order| {
+            .children(self.orders.iter().enumerate().map(|(idx, order)| {
                 let side_color = if order.side.to_lowercase().contains("buy") {
                     rgb(0x3fb950)
                 } else {
@@ -1639,6 +1670,28 @@ impl BarChart {
                             .text_sm()
                             .text_color(rgb(0x8b949e))
                             .child(order.created_at.clone()),
+                    )
+                    .child(
+                        div().w(px(80.0)).child(
+                            div()
+                                .id(ElementId::Name(format!("cancel-order-{}", idx).into()))
+                                .px_3()
+                                .py_1()
+                                .bg(rgb(0xda3633))
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(rgb(0xffffff))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0xff4444)))
+                                .child("Cancel")
+                                .on_click({
+                                    let order_id = order.id.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.cancel_order(order_id.clone(), cx);
+                                    })
+                                }),
+                        ),
                     )
             }))
     }
@@ -2051,6 +2104,32 @@ fn submit_order_sync(
         match result {
             Ok(order) => Ok(order.id),
             Err(e) => Err(format!("Failed to submit order: {:?}", e)),
+        }
+    })
+}
+
+// Synchronous function to cancel an order (runs in background thread)
+fn cancel_order_sync(order_id: String) -> Result<(), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
+
+    rt.block_on(async {
+        let config = match AlpacaConfig::from_env() {
+            Ok(config) => config,
+            Err(e) => {
+                return Err(format!(
+                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
+                    e
+                ));
+            }
+        };
+
+        let client = TradingClient::new(config);
+
+        let result = client.cancel_order(&order_id).await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("Failed to cancel order: {:?}", e)),
         }
     })
 }
