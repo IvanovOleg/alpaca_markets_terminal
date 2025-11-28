@@ -1,4 +1,4 @@
-use alpaca_markets::{AlpacaConfig, Bar, MarketDataClient};
+use alpaca_markets::{AlpacaConfig, Bar, MarketDataClient, TradingClient};
 use chrono::{Duration, Utc};
 use gpui::{
     App, Application, Context, ElementId, FocusHandle, FontWeight, IntoElement, Render, Window,
@@ -16,6 +16,14 @@ struct BarChart {
     error: Option<String>,
     input_focused: bool,
     focus_handle: FocusHandle,
+    // Account information
+    account_number: Option<String>,
+    account_status: Option<String>,
+    buying_power: Option<f64>,
+    cash: Option<f64>,
+    portfolio_value: Option<f64>,
+    equity: Option<f64>,
+    account_loading: bool,
 }
 
 impl BarChart {
@@ -29,10 +37,18 @@ impl BarChart {
             error: None,
             input_focused: false,
             focus_handle: cx.focus_handle(),
+            account_number: None,
+            account_status: None,
+            buying_power: None,
+            cash: None,
+            portfolio_value: None,
+            equity: None,
+            account_loading: true,
         };
 
         // Fetch data on startup
         chart.fetch_bars(cx);
+        chart.fetch_account(cx);
         chart
     }
 
@@ -58,6 +74,39 @@ impl BarChart {
             self.input_focused = false;
             self.fetch_bars(cx);
         }
+    }
+
+    fn fetch_account(&mut self, cx: &mut Context<Self>) {
+        self.account_loading = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { fetch_account_sync() })
+                .await;
+
+            let _ = this.update(cx, |chart, cx| {
+                match result {
+                    Ok(account_data) => {
+                        chart.account_number = Some(account_data.0);
+                        chart.account_status = Some(account_data.1);
+                        chart.buying_power = Some(account_data.2);
+                        chart.cash = Some(account_data.3);
+                        chart.portfolio_value = Some(account_data.4);
+                        chart.equity = Some(account_data.5);
+                        println!("✓ Successfully loaded account information");
+                    }
+                    Err(error) => {
+                        eprintln!("✗ Error fetching account: {}", error);
+                        chart.account_status = Some("Error".to_string());
+                    }
+                }
+                chart.account_loading = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn fetch_bars(&mut self, cx: &mut Context<Self>) {
@@ -527,10 +576,117 @@ impl Render for BarChart {
                             .child("💡 Set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables to fetch live data from Alpaca Markets."),
                     ),
             )
+            .child(
+                // Account Information Footer
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(rgb(0x161b22))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x30363d))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .child("Trading Account Information"),
+                            )
+                            .child(
+                                div()
+                                    .id("refresh-account-button")
+                                    .px_3()
+                                    .py_1()
+                                    .bg(rgb(0x238636))
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(0xffffff))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgb(0x2ea043)))
+                                    .child(if self.account_loading {
+                                        "⟳ Loading..."
+                                    } else {
+                                        "↻ Refresh"
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.fetch_account(cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_6()
+                            .text_sm()
+                            .child(
+                                self.render_account_stat("Account Number".to_string(),
+                                    self.account_number.clone().unwrap_or("Loading...".to_string()),
+                                    rgb(0xa371f7))
+                            )
+                            .child(
+                                self.render_account_stat("Account Status".to_string(),
+                                    self.account_status.clone().unwrap_or("Loading...".to_string()),
+                                    rgb(0x58a6ff))
+                            )
+                            .child(
+                                self.render_account_stat("Portfolio Value".to_string(),
+                                    format!("${:.2}", self.portfolio_value.unwrap_or(0.0)),
+                                    rgb(0x3fb950))
+                            )
+                            .child(
+                                self.render_account_stat("Equity".to_string(),
+                                    format!("${:.2}", self.equity.unwrap_or(0.0)),
+                                    rgb(0x3fb950))
+                            )
+                            .child(
+                                self.render_account_stat("Cash".to_string(),
+                                    format!("${:.2}", self.cash.unwrap_or(0.0)),
+                                    rgb(0xf2cc60))
+                            )
+                            .child(
+                                self.render_account_stat("Buying Power".to_string(),
+                                    format!("${:.2}", self.buying_power.unwrap_or(0.0)),
+                                    rgb(0xf2cc60))
+                            ),
+                    ),
+            )
     }
 }
 
 impl BarChart {
+    fn render_account_stat(
+        &self,
+        label: String,
+        value: String,
+        color: gpui::Rgba,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8b949e))
+                    .child(label.clone()),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(color)
+                    .child(value.clone()),
+            )
+    }
+
     fn render_timeframe_button(
         &self,
         timeframe: &str,
@@ -582,6 +738,47 @@ impl BarChart {
                 this.fetch_bars(cx);
             }))
     }
+}
+
+// Synchronous function to fetch account info (runs in background thread)
+fn fetch_account_sync() -> Result<(String, String, f64, f64, f64, f64), String> {
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
+
+    rt.block_on(async {
+        let config = match AlpacaConfig::from_env() {
+            Ok(config) => config,
+            Err(e) => {
+                return Err(format!(
+                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
+                    e
+                ));
+            }
+        };
+
+        let client = TradingClient::new(config);
+
+        let result = client.get_account().await;
+
+        match result {
+            Ok(account) => {
+                // Parse string values to f64
+                let buying_power = account.buying_power.parse::<f64>().unwrap_or(0.0);
+                let cash = account.cash.parse::<f64>().unwrap_or(0.0);
+                let portfolio_value = account.portfolio_value.parse::<f64>().unwrap_or(0.0);
+                let equity = account.equity.parse::<f64>().unwrap_or(0.0);
+
+                Ok((
+                    account.account_number,
+                    format!("{:?}", account.status),
+                    buying_power,
+                    cash,
+                    portfolio_value,
+                    equity,
+                ))
+            },
+            Err(e) => Err(format!("Error fetching account: {:?}", e)),
+        }
+    })
 }
 
 // Synchronous function to fetch bars (runs in background thread)
