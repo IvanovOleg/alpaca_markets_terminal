@@ -1,31 +1,63 @@
 use alpaca_markets::{AlpacaConfig, Bar, MarketDataClient};
 use chrono::{Duration, Utc};
 use gpui::{
-    App, Application, Context, FontWeight, IntoElement, Render, Window, WindowOptions, actions,
-    div, prelude::*, px, rgb,
+    App, Application, Context, ElementId, FocusHandle, FontWeight, IntoElement, Render, Window,
+    WindowOptions, actions, div, prelude::*, px, rgb,
 };
 
 actions!(app, [Quit, RefreshData]);
 
 struct BarChart {
     symbol: String,
+    symbol_input: String,
+    timeframe: String,
     bars: Vec<Bar>,
     loading: bool,
     error: Option<String>,
+    input_focused: bool,
+    focus_handle: FocusHandle,
 }
 
 impl BarChart {
     fn new(cx: &mut Context<Self>) -> Self {
         let mut chart = Self {
             symbol: "AAPL".to_string(),
+            symbol_input: "AAPL".to_string(),
+            timeframe: "1Day".to_string(),
             bars: Vec::new(),
             loading: true,
             error: None,
+            input_focused: false,
+            focus_handle: cx.focus_handle(),
         };
 
         // Fetch data on startup
         chart.fetch_bars(cx);
         chart
+    }
+
+    fn handle_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        if !self.input_focused {
+            return;
+        }
+        self.symbol_input.push_str(text);
+        cx.notify();
+    }
+
+    fn handle_backspace(&mut self, cx: &mut Context<Self>) {
+        if !self.input_focused {
+            return;
+        }
+        self.symbol_input.pop();
+        cx.notify();
+    }
+
+    fn submit_symbol(&mut self, cx: &mut Context<Self>) {
+        if !self.symbol_input.is_empty() {
+            self.symbol = self.symbol_input.clone().to_uppercase();
+            self.input_focused = false;
+            self.fetch_bars(cx);
+        }
     }
 
     fn fetch_bars(&mut self, cx: &mut Context<Self>) {
@@ -35,13 +67,14 @@ impl BarChart {
         cx.notify();
 
         let symbol = self.symbol.clone();
+        let timeframe = self.timeframe.clone();
 
         // Modern GPUI async pattern with AsyncApp::update()
         cx.spawn(async move |this, cx| {
             // Run the blocking API call in a background thread
             let result = cx
                 .background_executor()
-                .spawn(async move { fetch_bars_sync(&symbol) })
+                .spawn(async move { fetch_bars_sync(&symbol, &timeframe) })
                 .await;
 
             // Update UI using AsyncApp::update()
@@ -234,6 +267,17 @@ impl BarChart {
 
 impl Render for BarChart {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let timeframe_display = match self.timeframe.as_str() {
+            "1Min" => "1 Minute",
+            "5Min" => "5 Minutes",
+            "15Min" => "15 Minutes",
+            "1Hour" => "1 Hour",
+            "1Day" => "Daily",
+            "1Week" => "Weekly",
+            "1Month" => "Monthly",
+            _ => &self.timeframe,
+        };
+
         div()
             .flex()
             .flex_col()
@@ -241,6 +285,28 @@ impl Render for BarChart {
             .size_full()
             .p_8()
             .gap_6()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if !this.input_focused {
+                    return;
+                }
+
+                let key = event.keystroke.key.as_str();
+
+                if key == "enter" {
+                    this.submit_symbol(cx);
+                } else if key == "backspace" {
+                    this.handle_backspace(cx);
+                } else if key == "escape" {
+                    this.input_focused = false;
+                    cx.notify();
+                } else if let Some(key_char) = &event.keystroke.key_char {
+                    // Use key_char for actual character input (handles shift + letter for uppercase)
+                    if key_char.len() == 1 && key_char.chars().all(|c| c.is_alphanumeric()) {
+                        this.handle_input(key_char, cx);
+                    }
+                }
+            }))
             .child(
                 // Header
                 div()
@@ -263,7 +329,7 @@ impl Render for BarChart {
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x808080))
-                                    .child("Daily candlestick chart powered by Alpaca Markets"),
+                                    .child(format!("{} candlestick chart powered by Alpaca Markets", timeframe_display)),
                             ),
                     )
                     .child(
@@ -285,6 +351,109 @@ impl Render for BarChart {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.fetch_bars(cx);
                             })),
+                    ),
+            )
+            .child(
+                // Controls: Symbol input and Timeframe selector
+                div()
+                    .flex()
+                    .gap_4()
+                    .items_end()
+                    .child(
+                        // Symbol input
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .child("Symbol:"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("symbol-input")
+                                            .px_4()
+                                            .py_2()
+                                            .bg(if self.input_focused {
+                                                rgb(0x1f2937)
+                                            } else {
+                                                rgb(0x161b22)
+                                            })
+                                            .border_1()
+                                            .border_color(if self.input_focused {
+                                                rgb(0x1f6feb)
+                                            } else {
+                                                rgb(0x30363d)
+                                            })
+                                            .rounded_lg()
+                                            .text_color(rgb(0xffffff))
+                                            .min_w(px(120.0))
+                                            .cursor_text()
+                                            .child(
+                                                if self.input_focused {
+                                                    format!("{}|", self.symbol_input)
+                                                } else if self.symbol_input.is_empty() {
+                                                    "Enter symbol...".to_string()
+                                                } else {
+                                                    self.symbol_input.clone()
+                                                }
+                                            )
+                                            .on_click(cx.listener(|this, _, _window, cx| {
+                                                this.input_focused = true;
+                                                _window.focus(&this.focus_handle);
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("update-symbol-button")
+                                            .px_4()
+                                            .py_2()
+                                            .bg(rgb(0x1f6feb))
+                                            .rounded_lg()
+                                            .text_color(rgb(0xffffff))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x388bfd)))
+                                            .child("Update")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit_symbol(cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        // Timeframe selector
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .child("Timeframe:"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(self.render_timeframe_button("1Min", "1m", cx))
+                                    .child(self.render_timeframe_button("5Min", "5m", cx))
+                                    .child(self.render_timeframe_button("15Min", "15m", cx))
+                                    .child(self.render_timeframe_button("1Hour", "1h", cx))
+                                    .child(self.render_timeframe_button("1Day", "1D", cx))
+                                    .child(self.render_timeframe_button("1Week", "1W", cx))
+                                    .child(self.render_timeframe_button("1Month", "1M", cx)),
+                            ),
                     ),
             )
             .child(
@@ -361,8 +530,62 @@ impl Render for BarChart {
     }
 }
 
+impl BarChart {
+    fn render_timeframe_button(
+        &self,
+        timeframe: &str,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_selected = self.timeframe == timeframe;
+        let timeframe_owned = timeframe.to_string();
+        let label_owned = label.to_string();
+        let element_id = format!("timeframe-{}", timeframe);
+
+        div()
+            .id(ElementId::Name(element_id.into()))
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .text_color(if is_selected {
+                rgb(0xffffff)
+            } else {
+                rgb(0x8b949e)
+            })
+            .bg(if is_selected {
+                rgb(0x1f6feb)
+            } else {
+                rgb(0x161b22)
+            })
+            .border_1()
+            .border_color(if is_selected {
+                rgb(0x1f6feb)
+            } else {
+                rgb(0x30363d)
+            })
+            .font_weight(if is_selected {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::NORMAL
+            })
+            .cursor_pointer()
+            .hover(|style| {
+                if is_selected {
+                    style.bg(rgb(0x388bfd))
+                } else {
+                    style.bg(rgb(0x21262d))
+                }
+            })
+            .child(label_owned)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.timeframe = timeframe_owned.clone();
+                this.fetch_bars(cx);
+            }))
+    }
+}
+
 // Synchronous function to fetch bars (runs in background thread)
-fn fetch_bars_sync(symbol: &str) -> Result<Vec<Bar>, String> {
+fn fetch_bars_sync(symbol: &str, timeframe: &str) -> Result<Vec<Bar>, String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
 
     rt.block_on(async {
@@ -379,12 +602,21 @@ fn fetch_bars_sync(symbol: &str) -> Result<Vec<Bar>, String> {
 
         let client = MarketDataClient::new(config);
 
-        // Fetch last 100 bars of 1-day data
+        // Fetch bars based on timeframe
         let end_time = Utc::now();
-        let start_time = end_time - Duration::days(200);
+        let (start_time, limit) = match timeframe {
+            "1Min" => (end_time - Duration::hours(24), Some(100)),
+            "5Min" => (end_time - Duration::days(5), Some(100)),
+            "15Min" => (end_time - Duration::days(10), Some(100)),
+            "1Hour" => (end_time - Duration::days(30), Some(100)),
+            "1Day" => (end_time - Duration::days(200), Some(100)),
+            "1Week" => (end_time - Duration::days(700), Some(100)),
+            "1Month" => (end_time - Duration::days(2500), Some(100)),
+            _ => (end_time - Duration::days(200), Some(100)),
+        };
 
         let result = client
-            .get_bars(symbol, "1Day", Some(start_time), Some(end_time), Some(100))
+            .get_bars(symbol, timeframe, Some(start_time), Some(end_time), limit)
             .await;
 
         match result {
