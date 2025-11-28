@@ -82,6 +82,9 @@ struct BarChart {
     // WebSocket stream
     stream_connected: bool,
     stream_status: String,
+    // Market data stream
+    market_data_connected: bool,
+    last_bar_time: Option<String>,
 }
 
 impl BarChart {
@@ -118,6 +121,8 @@ impl BarChart {
             price_focused: false,
             stream_connected: false,
             stream_status: "Disconnected".to_string(),
+            market_data_connected: false,
+            last_bar_time: None,
         };
 
         // Fetch data on startup
@@ -125,6 +130,7 @@ impl BarChart {
         chart.fetch_account(cx);
         chart.fetch_positions(cx);
         chart.start_websocket_stream(cx);
+        chart.start_market_data_stream(cx);
         chart.fetch_orders(cx);
         chart
     }
@@ -256,7 +262,7 @@ impl BarChart {
                 .spawn(async move { cancel_order_sync(order_id) })
                 .await;
 
-            let _ = this.update(cx, |chart, cx| {
+            let _ = this.update(cx, |_chart, cx| {
                 match result {
                     Ok(_) => {
                         println!("✓ Order canceled successfully");
@@ -431,6 +437,21 @@ impl BarChart {
                 self.stream_status = format!("Error: {}", error);
                 cx.notify();
             }
+            StreamUpdate::MarketDataConnected => {
+                println!("✅ Market Data WebSocket connected!");
+                self.market_data_connected = true;
+                cx.notify();
+            }
+            StreamUpdate::MarketDataDisconnected => {
+                println!("❌ Market Data WebSocket disconnected");
+                self.market_data_connected = false;
+                cx.notify();
+            }
+            StreamUpdate::BarUpdate(bar_update) => {
+                println!("📊 Received bar update for: {}", bar_update.symbol);
+                self.update_bars_from_stream(bar_update, cx);
+                cx.notify();
+            }
         }
     }
 
@@ -507,6 +528,64 @@ impl BarChart {
 
         println!("✓ Account updated from stream");
     }
+
+    fn start_market_data_stream(&mut self, cx: &mut Context<Self>) {
+        println!("🚀 Starting Market Data WebSocket stream connection...");
+
+        // Create a channel for receiving updates from the WebSocket
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<stream::StreamUpdate>();
+
+        // Get the current symbol to subscribe to
+        let symbol = self.symbol.clone();
+
+        // Start the market data WebSocket stream in a background task
+        stream::MarketDataStreamManager::start_stream(sender, vec![symbol]);
+
+        // Spawn a task to listen for updates and apply them to the UI
+        cx.spawn(async move |this, cx| {
+            while let Some(update) = receiver.recv().await {
+                let _ = this.update(cx, |chart, cx| {
+                    chart.handle_stream_update(update, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn update_bars_from_stream(&mut self, bar_update: stream::BarUpdate, cx: &mut Context<Self>) {
+        // Only update if the bar is for the current symbol
+        if bar_update.symbol != self.symbol {
+            return;
+        }
+
+        // Parse the bar data and convert to Bar struct
+        // Note: We need to convert from the stream BarUpdate to alpaca_markets::Bar
+        // For now, we'll just update the last_bar_time to show we're receiving data
+        self.last_bar_time = Some(bar_update.timestamp.clone());
+
+        println!(
+            "✓ Bar updated for {} - O:{} H:{} L:{} C:{} V:{} @ {}",
+            bar_update.symbol,
+            bar_update.open,
+            bar_update.high,
+            bar_update.low,
+            bar_update.close,
+            bar_update.volume,
+            bar_update.timestamp
+        );
+
+        // Optionally: Add the new bar to the bars list
+        // This would require converting BarUpdate to Bar, which depends on
+        // the Bar struct definition in alpaca_markets
+        // For real-time updates, you might want to:
+        // 1. Append the bar to self.bars if it's a new bar
+        // 2. Update the last bar if it's an update to the current bar
+        // 3. Trigger a chart refresh
+
+        // For now, just notify to update the UI
+        cx.notify();
+    }
+
     fn fetch_bars(&mut self, cx: &mut Context<Self>) {
         self.loading = true;
         self.error = None;
@@ -664,7 +743,9 @@ impl BarChart {
                             .child(
                                 div()
                                     .absolute()
-                                    .left(px(x + actual_candle_width / 2.0 - 0.5))
+                                    .left(px(
+                                        x + candle_spacing / 2.0 + actual_candle_width / 2.0 - 0.5
+                                    ))
                                     .top(px(high_y))
                                     .w(px(1.0))
                                     .h(px(low_y - high_y))
@@ -737,329 +818,79 @@ impl Render for BarChart {
                     .flex_1()
                     .p_8()
                     .gap_6()
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                // Handle symbol input
-                if this.input_focused {
-                    let key = event.keystroke.key.as_str();
+                    .track_focus(&self.focus_handle)
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                        // Handle symbol input
+                        if this.input_focused {
+                            let key = event.keystroke.key.as_str();
 
-                    if key == "enter" {
-                        this.submit_symbol(cx);
-                    } else if key == "backspace" {
-                        this.handle_backspace(cx);
-                    } else if key == "escape" {
-                        this.input_focused = false;
-                        cx.notify();
-                    } else if let Some(key_char) = &event.keystroke.key_char {
-                        if key_char.len() == 1 && key_char.chars().all(|c| c.is_alphanumeric()) {
-                            this.handle_input(key_char, cx);
+                            if key == "enter" {
+                                this.submit_symbol(cx);
+                            } else if key == "backspace" {
+                                this.handle_backspace(cx);
+                            } else if key == "escape" {
+                                this.input_focused = false;
+                                cx.notify();
+                            } else if let Some(key_char) = &event.keystroke.key_char {
+                                if key_char.len() == 1
+                                    && key_char.chars().all(|c| c.is_alphanumeric())
+                                {
+                                    this.handle_input(key_char, cx);
+                                }
+                            }
+                            return;
                         }
-                    }
-                    return;
-                }
 
-                // Handle quantity input
-                if this.quantity_focused {
-                    let key = event.keystroke.key.as_str();
+                        // Handle quantity input
+                        if this.quantity_focused {
+                            let key = event.keystroke.key.as_str();
 
-                    if key == "enter" {
-                        this.quantity_focused = false;
-                        cx.notify();
-                    } else if key == "backspace" {
-                        this.order_quantity.pop();
-                        cx.notify();
-                    } else if key == "escape" {
-                        this.quantity_focused = false;
-                        cx.notify();
-                    } else if let Some(key_char) = &event.keystroke.key_char {
-                        if key_char.len() == 1 && (key_char.chars().all(|c| c.is_numeric()) || key_char == ".") {
-                            this.order_quantity.push_str(key_char);
-                            cx.notify();
+                            if key == "enter" {
+                                this.quantity_focused = false;
+                                cx.notify();
+                            } else if key == "backspace" {
+                                this.order_quantity.pop();
+                                cx.notify();
+                            } else if key == "escape" {
+                                this.quantity_focused = false;
+                                cx.notify();
+                            } else if let Some(key_char) = &event.keystroke.key_char {
+                                if key_char.len() == 1
+                                    && (key_char.chars().all(|c| c.is_numeric()) || key_char == ".")
+                                {
+                                    this.order_quantity.push_str(key_char);
+                                    cx.notify();
+                                }
+                            }
+                            return;
                         }
-                    }
-                    return;
-                }
 
-                // Handle price input
-                if this.price_focused {
-                    let key = event.keystroke.key.as_str();
+                        // Handle price input
+                        if this.price_focused {
+                            let key = event.keystroke.key.as_str();
 
-                    if key == "enter" {
-                        this.price_focused = false;
-                        cx.notify();
-                    } else if key == "backspace" {
-                        this.order_limit_price.pop();
-                        cx.notify();
-                    } else if key == "escape" {
-                        this.price_focused = false;
-                        cx.notify();
-                    } else if let Some(key_char) = &event.keystroke.key_char {
-                        if key_char.len() == 1 && (key_char.chars().all(|c| c.is_numeric()) || key_char == ".") {
-                            this.order_limit_price.push_str(key_char);
-                            cx.notify();
+                            if key == "enter" {
+                                this.price_focused = false;
+                                cx.notify();
+                            } else if key == "backspace" {
+                                this.order_limit_price.pop();
+                                cx.notify();
+                            } else if key == "escape" {
+                                this.price_focused = false;
+                                cx.notify();
+                            } else if let Some(key_char) = &event.keystroke.key_char {
+                                if key_char.len() == 1
+                                    && (key_char.chars().all(|c| c.is_numeric()) || key_char == ".")
+                                {
+                                    this.order_limit_price.push_str(key_char);
+                                    cx.notify();
+                                }
+                            }
+                            return;
                         }
-                    }
-                    return;
-                }
-            }))
-            .child(
-                // Header
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
+                    }))
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(0xffffff))
-                                    .child(format!("{} Stock Chart", self.symbol)),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x808080))
-                                    .child(format!("{} candlestick chart powered by Alpaca Markets", timeframe_display)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("refresh-button")
-                            .px_6()
-                            .py_3()
-                            .bg(rgb(0x238636))
-                            .rounded_lg()
-                            .text_color(rgb(0xffffff))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x2ea043)))
-                            .child(if self.loading {
-                                "⟳ Loading..."
-                            } else {
-                                "↻ Refresh Data"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.fetch_bars(cx);
-                            })),
-                    )
-                    .child(
-                        // WebSocket Status Indicator
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_4()
-                            .py_3()
-                            .rounded_lg()
-                            .bg(if self.stream_connected {
-                                rgb(0x238636)
-                            } else {
-                                rgb(0x6e7681)
-                            })
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0xffffff))
-                                    .child(if self.stream_connected {
-                                        "🟢 Live Updates"
-                                    } else {
-                                        "⭕ Disconnected"
-                                    })
-                            )
-                    )
-            )
-            .child(
-                // Controls: Symbol input and Timeframe selector
-                div()
-                    .flex()
-                    .gap_4()
-                    .items_end()
-                    .child(
-                        // Symbol input
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xffffff))
-                                    .child("Symbol:"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .id("symbol-input")
-                                            .px_4()
-                                            .py_2()
-                                            .bg(if self.input_focused {
-                                                rgb(0x1f2937)
-                                            } else {
-                                                rgb(0x161b22)
-                                            })
-                                            .border_1()
-                                            .border_color(if self.input_focused {
-                                                rgb(0x1f6feb)
-                                            } else {
-                                                rgb(0x30363d)
-                                            })
-                                            .rounded_lg()
-                                            .text_color(rgb(0xffffff))
-                                            .min_w(px(120.0))
-                                            .cursor_text()
-                                            .child(
-                                                if self.input_focused {
-                                                    format!("{}|", self.symbol_input)
-                                                } else if self.symbol_input.is_empty() {
-                                                    "Enter symbol...".to_string()
-                                                } else {
-                                                    self.symbol_input.clone()
-                                                }
-                                            )
-                                            .on_click(cx.listener(|this, _, _window, cx| {
-                                                this.input_focused = true;
-                                                _window.focus(&this.focus_handle);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("update-symbol-button")
-                                            .px_4()
-                                            .py_2()
-                                            .bg(rgb(0x1f6feb))
-                                            .rounded_lg()
-                                            .text_color(rgb(0xffffff))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0x388bfd)))
-                                            .child("Update")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.submit_symbol(cx);
-                                            })),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        // Timeframe selector
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xffffff))
-                                    .child("Timeframe:"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(self.render_timeframe_button("1Min", "1m", cx))
-                                    .child(self.render_timeframe_button("5Min", "5m", cx))
-                                    .child(self.render_timeframe_button("15Min", "15m", cx))
-                                    .child(self.render_timeframe_button("1Hour", "1h", cx))
-                                    .child(self.render_timeframe_button("1Day", "1D", cx))
-                                    .child(self.render_timeframe_button("1Week", "1W", cx))
-                                    .child(self.render_timeframe_button("1Month", "1M", cx)),
-                            ),
-                    ),
-            )
-            .child(
-                // Chart area
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .child(self.render_candlesticks()),
-            )
-            .child(
-                // Footer with legend and instructions
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_4()
-                    .bg(rgb(0x161b22))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x30363d))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xffffff))
-                            .child("Legend & Instructions:"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_8()
-                            .text_xs()
-                            .text_color(rgb(0x8b949e))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(16.0))
-                                            .h(px(16.0))
-                                            .bg(rgb(0x00cc66))
-                                            .rounded_sm(),
-                                    )
-                                    .child("Green = Bullish (Close ≥ Open)"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(16.0))
-                                            .h(px(16.0))
-                                            .bg(rgb(0xff4444))
-                                            .rounded_sm(),
-                                    )
-                                    .child("Red = Bearish (Close < Open)"),
-                            )
-                            .child("Wicks show High/Low range")
-                            .child("Body shows Open/Close range"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x8b949e))
-                            .child("💡 Set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables to fetch live data from Alpaca Markets."),
-                    ),
-            )
-            .child(
-                // Tabbed Footer
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_4()
-                    .bg(rgb(0x161b22))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x30363d))
-                    .child(
-                        // Tab buttons and refresh button
+                        // Header
                         div()
                             .flex()
                             .items_center()
@@ -1067,130 +898,380 @@ impl Render for BarChart {
                             .child(
                                 div()
                                     .flex()
-                                    .gap_2()
+                                    .flex_col()
+                                    .gap_1()
                                     .child(
                                         div()
-                                            .id("tab-account")
-                                            .px_4()
-                                            .py_2()
-                                            .rounded_md()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .cursor_pointer()
-                                            .bg(if self.active_footer_tab == FooterTab::Account {
-                                                rgb(0x238636)
-                                            } else {
-                                                rgb(0x21262d)
-                                            })
+                                            .text_2xl()
+                                            .font_weight(FontWeight::BOLD)
                                             .text_color(rgb(0xffffff))
-                                            .hover(|style| {
-                                                if self.active_footer_tab == FooterTab::Account {
-                                                    style.bg(rgb(0x2ea043))
-                                                } else {
-                                                    style.bg(rgb(0x30363d))
-                                                }
-                                            })
-                                            .child("Account Information")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.active_footer_tab = FooterTab::Account;
-                                                cx.notify();
-                                            })),
+                                            .child(format!("{} Stock Chart", self.symbol)),
                                     )
-                                    .child(
-                                        div()
-                                            .id("tab-positions")
-                                            .px_4()
-                                            .py_2()
-                                            .rounded_md()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .cursor_pointer()
-                                            .bg(if self.active_footer_tab == FooterTab::Positions {
-                                                rgb(0x238636)
-                                            } else {
-                                                rgb(0x21262d)
-                                            })
-                                            .text_color(rgb(0xffffff))
-                                            .hover(|style| {
-                                                if self.active_footer_tab == FooterTab::Positions {
-                                                    style.bg(rgb(0x2ea043))
-                                                } else {
-                                                    style.bg(rgb(0x30363d))
-                                                }
-                                            })
-                                            .child("Active Positions")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.active_footer_tab = FooterTab::Positions;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("tab-orders")
-                                            .px_4()
-                                            .py_2()
-                                            .rounded_md()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .cursor_pointer()
-                                            .bg(if self.active_footer_tab == FooterTab::Orders {
-                                                rgb(0x238636)
-                                            } else {
-                                                rgb(0x21262d)
-                                            })
-                                            .text_color(rgb(0xffffff))
-                                            .hover(|style| {
-                                                if self.active_footer_tab == FooterTab::Orders {
-                                                    style.bg(rgb(0x2ea043))
-                                                } else {
-                                                    style.bg(rgb(0x30363d))
-                                                }
-                                            })
-                                            .child("Active Orders")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.active_footer_tab = FooterTab::Orders;
-                                                cx.notify();
-                                            })),
-                                    ),
+                                    .child(div().text_sm().text_color(rgb(0x808080)).child(
+                                        format!(
+                                            "{} candlestick chart powered by Alpaca Markets",
+                                            timeframe_display
+                                        ),
+                                    )),
                             )
                             .child(
                                 div()
-                                    .id("refresh-footer-button")
-                                    .px_3()
-                                    .py_1()
+                                    .id("refresh-button")
+                                    .px_6()
+                                    .py_3()
                                     .bg(rgb(0x238636))
-                                    .rounded_md()
-                                    .text_xs()
+                                    .rounded_lg()
                                     .text_color(rgb(0xffffff))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x2ea043)))
-                                    .child(if (self.active_footer_tab == FooterTab::Account && self.account_loading)
-                                        || (self.active_footer_tab == FooterTab::Positions && self.positions_loading)
-                                        || (self.active_footer_tab == FooterTab::Orders && self.orders_loading) {
+                                    .child(if self.loading {
                                         "⟳ Loading..."
                                     } else {
-                                        "↻ Refresh"
+                                        "↻ Refresh Data"
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        match this.active_footer_tab {
-                                            FooterTab::Account => this.fetch_account(cx),
-                                            FooterTab::Positions => this.fetch_positions(cx),
-                                            FooterTab::Orders => this.fetch_orders(cx),
-                                        }
+                                        this.fetch_bars(cx);
                                     })),
+                            )
+                            .child(
+                                // WebSocket Status Indicator
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_4()
+                                    .py_3()
+                                    .rounded_lg()
+                                    .bg(if self.stream_connected {
+                                        rgb(0x238636)
+                                    } else {
+                                        rgb(0x6e7681)
+                                    })
+                                    .child(div().text_sm().text_color(rgb(0xffffff)).child(
+                                        if self.stream_connected {
+                                            "🟢 Live Updates"
+                                        } else {
+                                            "⭕ Disconnected"
+                                        },
+                                    )),
+                            )
+                            .child(
+                                // Market Data WebSocket Status Indicator
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_4()
+                                    .py_3()
+                                    .rounded_lg()
+                                    .bg(if self.market_data_connected {
+                                        rgb(0x1f6feb)
+                                    } else {
+                                        rgb(0x6e7681)
+                                    })
+                                    .child(div().text_sm().text_color(rgb(0xffffff)).child(
+                                        if self.market_data_connected {
+                                            if let Some(ref last_time) = self.last_bar_time {
+                                                format!(
+                                                    "📊 Market Data (Last: {})",
+                                                    &last_time[11..19]
+                                                ) // Show just HH:MM:SS
+                                            } else {
+                                                "📊 Market Data".to_string()
+                                            }
+                                        } else {
+                                            "📊 No Market Data".to_string()
+                                        },
+                                    )),
                             ),
                     )
-                    .when(self.active_footer_tab == FooterTab::Account, |div| {
-                        div.child(self.render_account_tab())
-                    })
-                    .when(self.active_footer_tab == FooterTab::Positions, |div| {
-                        div.child(self.render_positions_tab(cx))
-                    })
-                    .when(self.active_footer_tab == FooterTab::Orders, |div| {
-                        div.child(self.render_orders_tab(cx))
-                    }),
-            )
+                    .child(
+                        // Controls: Symbol input and Timeframe selector
+                        div()
+                            .flex()
+                            .gap_4()
+                            .items_end()
+                            .child(
+                                // Symbol input
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(0xffffff))
+                                            .child("Symbol:"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .id("symbol-input")
+                                                    .px_4()
+                                                    .py_2()
+                                                    .bg(if self.input_focused {
+                                                        rgb(0x1f2937)
+                                                    } else {
+                                                        rgb(0x161b22)
+                                                    })
+                                                    .border_1()
+                                                    .border_color(if self.input_focused {
+                                                        rgb(0x1f6feb)
+                                                    } else {
+                                                        rgb(0x30363d)
+                                                    })
+                                                    .rounded_lg()
+                                                    .text_color(rgb(0xffffff))
+                                                    .min_w(px(120.0))
+                                                    .cursor_text()
+                                                    .child(if self.input_focused {
+                                                        format!("{}|", self.symbol_input)
+                                                    } else if self.symbol_input.is_empty() {
+                                                        "Enter symbol...".to_string()
+                                                    } else {
+                                                        self.symbol_input.clone()
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        |this, _, _window, cx| {
+                                                            this.input_focused = true;
+                                                            _window.focus(&this.focus_handle);
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("update-symbol-button")
+                                                    .px_4()
+                                                    .py_2()
+                                                    .bg(rgb(0x1f6feb))
+                                                    .rounded_lg()
+                                                    .text_color(rgb(0xffffff))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .cursor_pointer()
+                                                    .hover(|style| style.bg(rgb(0x388bfd)))
+                                                    .child("Update")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.submit_symbol(cx);
+                                                    })),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                // Timeframe selector
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(0xffffff))
+                                            .child("Timeframe:"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .child(self.render_timeframe_button("1Min", "1m", cx))
+                                            .child(self.render_timeframe_button("5Min", "5m", cx))
+                                            .child(self.render_timeframe_button("15Min", "15m", cx))
+                                            .child(self.render_timeframe_button("1Hour", "1h", cx))
+                                            .child(self.render_timeframe_button("1Day", "1D", cx))
+                                            .child(self.render_timeframe_button("1Week", "1W", cx))
+                                            .child(
+                                                self.render_timeframe_button("1Month", "1M", cx),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        // Chart area
+                        div()
+                            .flex()
+                            .flex_1()
+                            .items_center()
+                            .justify_center()
+                            .child(self.render_candlesticks()),
+                    )
+                    .child(
+                        // Tabbed Footer
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .p_4()
+                            .bg(rgb(0x161b22))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(0x30363d))
+                            .child(
+                                // Tab buttons and refresh button
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .id("tab-account")
+                                                    .px_4()
+                                                    .py_2()
+                                                    .rounded_md()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .cursor_pointer()
+                                                    .bg(
+                                                        if self.active_footer_tab
+                                                            == FooterTab::Account
+                                                        {
+                                                            rgb(0x238636)
+                                                        } else {
+                                                            rgb(0x21262d)
+                                                        },
+                                                    )
+                                                    .text_color(rgb(0xffffff))
+                                                    .hover(|style| {
+                                                        if self.active_footer_tab
+                                                            == FooterTab::Account
+                                                        {
+                                                            style.bg(rgb(0x2ea043))
+                                                        } else {
+                                                            style.bg(rgb(0x30363d))
+                                                        }
+                                                    })
+                                                    .child("Account Information")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.active_footer_tab = FooterTab::Account;
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("tab-positions")
+                                                    .px_4()
+                                                    .py_2()
+                                                    .rounded_md()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .cursor_pointer()
+                                                    .bg(
+                                                        if self.active_footer_tab
+                                                            == FooterTab::Positions
+                                                        {
+                                                            rgb(0x238636)
+                                                        } else {
+                                                            rgb(0x21262d)
+                                                        },
+                                                    )
+                                                    .text_color(rgb(0xffffff))
+                                                    .hover(|style| {
+                                                        if self.active_footer_tab
+                                                            == FooterTab::Positions
+                                                        {
+                                                            style.bg(rgb(0x2ea043))
+                                                        } else {
+                                                            style.bg(rgb(0x30363d))
+                                                        }
+                                                    })
+                                                    .child("Active Positions")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.active_footer_tab =
+                                                            FooterTab::Positions;
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("tab-orders")
+                                                    .px_4()
+                                                    .py_2()
+                                                    .rounded_md()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .cursor_pointer()
+                                                    .bg(
+                                                        if self.active_footer_tab
+                                                            == FooterTab::Orders
+                                                        {
+                                                            rgb(0x238636)
+                                                        } else {
+                                                            rgb(0x21262d)
+                                                        },
+                                                    )
+                                                    .text_color(rgb(0xffffff))
+                                                    .hover(|style| {
+                                                        if self.active_footer_tab
+                                                            == FooterTab::Orders
+                                                        {
+                                                            style.bg(rgb(0x2ea043))
+                                                        } else {
+                                                            style.bg(rgb(0x30363d))
+                                                        }
+                                                    })
+                                                    .child("Active Orders")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.active_footer_tab = FooterTab::Orders;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("refresh-footer-button")
+                                            .px_3()
+                                            .py_1()
+                                            .bg(rgb(0x238636))
+                                            .rounded_md()
+                                            .text_xs()
+                                            .text_color(rgb(0xffffff))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x2ea043)))
+                                            .child(
+                                                if (self.active_footer_tab == FooterTab::Account
+                                                    && self.account_loading)
+                                                    || (self.active_footer_tab
+                                                        == FooterTab::Positions
+                                                        && self.positions_loading)
+                                                    || (self.active_footer_tab == FooterTab::Orders
+                                                        && self.orders_loading)
+                                                {
+                                                    "⟳ Loading..."
+                                                } else {
+                                                    "↻ Refresh"
+                                                },
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                match this.active_footer_tab {
+                                                    FooterTab::Account => this.fetch_account(cx),
+                                                    FooterTab::Positions => {
+                                                        this.fetch_positions(cx)
+                                                    }
+                                                    FooterTab::Orders => this.fetch_orders(cx),
+                                                }
+                                            })),
+                                    ),
+                            )
+                            .when(self.active_footer_tab == FooterTab::Account, |div| {
+                                div.child(self.render_account_tab())
+                            })
+                            .when(self.active_footer_tab == FooterTab::Positions, |div| {
+                                div.child(self.render_positions_tab(cx))
+                            })
+                            .when(self.active_footer_tab == FooterTab::Orders, |div| {
+                                div.child(self.render_orders_tab(cx))
+                            }),
+                    ),
             )
             .child(
                 // Right sidebar - Order form
@@ -1210,34 +1291,34 @@ impl Render for BarChart {
                             .font_weight(FontWeight::BOLD)
                             .text_color(rgb(0xffffff))
                             .child("Place Order"),
-                            )
+                    )
+                    .child(
+                        // Current symbol display
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
                             .child(
-                                // Current symbol display
                                 div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(0xffffff))
-                                            .child("Trading Symbol"),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_3()
-                                            .py_2()
-                                            .bg(rgb(0x0d1117))
-                                            .border_1()
-                                            .border_color(rgb(0x1f6feb))
-                                            .rounded_md()
-                                            .text_color(rgb(0x58a6ff))
-                                            .font_weight(FontWeight::BOLD)
-                                            .child(self.symbol.clone()),
-                                    ),
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .child("Trading Symbol"),
                             )
                             .child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .bg(rgb(0x0d1117))
+                                    .border_1()
+                                    .border_color(rgb(0x1f6feb))
+                                    .rounded_md()
+                                    .text_color(rgb(0x58a6ff))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(self.symbol.clone()),
+                            ),
+                    )
+                    .child(
                         // Order side (Buy/Sell)
                         div()
                             .flex()
@@ -1441,11 +1522,11 @@ impl Render for BarChart {
                     )
                     .child(
                         // Limit price input (shown only for limit orders)
-                        self.render_limit_price_input(cx)
+                        self.render_limit_price_input(cx),
                     )
                     .child(
                         // Time in Force (shown only for limit orders)
-                        self.render_time_in_force(cx)
+                        self.render_time_in_force(cx),
                     )
                     .child(
                         // Submit button
@@ -1474,8 +1555,13 @@ impl Render for BarChart {
                             .child(if self.order_submitting {
                                 "Submitting...".to_string()
                             } else {
-                                format!("{} {}",
-                                    if matches!(self.order_side, OrderSide::Buy) { "Buy" } else { "Sell" },
+                                format!(
+                                    "{} {}",
+                                    if matches!(self.order_side, OrderSide::Buy) {
+                                        "Buy"
+                                    } else {
+                                        "Sell"
+                                    },
                                     self.symbol
                                 )
                             })
@@ -1485,9 +1571,7 @@ impl Render for BarChart {
                                 }
                             })),
                     )
-                    .child(
-                        self.render_order_message(cx)
-                    )
+                    .child(self.render_order_message(cx)),
             )
     }
 }

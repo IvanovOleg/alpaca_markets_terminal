@@ -13,6 +13,9 @@ pub enum StreamUpdate {
     Disconnected,
     TradeUpdate(OrderUpdate),
     AccountUpdate(AccountInfo),
+    BarUpdate(BarUpdate),
+    MarketDataConnected,
+    MarketDataDisconnected,
     Error(String),
 }
 
@@ -36,6 +39,20 @@ pub struct AccountInfo {
     pub buying_power: String,
     pub cash: String,
     pub portfolio_value: String,
+}
+
+/// Bar update information from market data stream
+#[derive(Clone, Debug)]
+pub struct BarUpdate {
+    pub symbol: String,
+    pub timestamp: String,
+    pub open: String,
+    pub high: String,
+    pub low: String,
+    pub close: String,
+    pub volume: String,
+    pub trade_count: Option<u64>,
+    pub vwap: Option<String>,
 }
 
 /// WebSocket stream manager
@@ -242,5 +259,212 @@ fn convert_trade_update(trade: TradeUpdate) -> OrderUpdate {
         status: trade.order.status.clone(),
         created_at: trade.order.created_at.to_rfc3339(),
         event: trade.event.to_string(),
+    }
+}
+
+/// Market Data Stream Manager
+pub struct MarketDataStreamManager {
+    sender: mpsc::UnboundedSender<StreamUpdate>,
+}
+
+impl MarketDataStreamManager {
+    /// Create a new market data stream manager
+    pub fn new(sender: mpsc::UnboundedSender<StreamUpdate>) -> Self {
+        Self { sender }
+    }
+
+    /// Start the market data WebSocket connection in a background task
+    pub fn start_stream(
+        sender: mpsc::UnboundedSender<StreamUpdate>,
+        symbols: Vec<String>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            // Create a Tokio runtime for this thread
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                println!("🚀 Starting Alpaca Market Data WebSocket stream...");
+                println!("📊 Subscribing to bars for symbols: {:?}", symbols);
+
+                // Create configuration
+                let config = match AlpacaConfig::from_env() {
+                    Ok(config) => {
+                        println!("✅ Market Data configuration loaded from environment variables");
+                        config
+                    }
+                    Err(_) => {
+                        println!("⚠️  Environment variables not found. Using demo configuration.");
+                        println!(
+                            "   To use real data, set APCA_API_KEY_ID and APCA_API_SECRET_KEY"
+                        );
+
+                        AlpacaConfig::new(
+                            "DEMO_KEY".to_string(),
+                            "DEMO_SECRET".to_string(),
+                            true, // Use paper trading
+                        )
+                    }
+                };
+
+                // Import market data stream client
+                use alpaca_markets::clients::market_data_stream::{MarketDataStreamClient, Feed};
+
+                // Create market data stream client (using IEX feed)
+                let mut client = MarketDataStreamClient::new(config, Feed::Iex);
+
+                println!("🔌 Connecting to Alpaca Market Data WebSocket...");
+
+                match client.connect().await {
+                    Ok(_) => {
+                        println!("✅ Connected to market data stream!");
+                        let _ = sender.send(StreamUpdate::MarketDataConnected);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Market Data connection failed: {}", e);
+                        let _ = sender.send(StreamUpdate::Error(format!(
+                            "Market Data connection failed: {}",
+                            e
+                        )));
+                        let _ = sender.send(StreamUpdate::MarketDataDisconnected);
+                        return;
+                    }
+                }
+
+                // Subscribe to bars for the specified symbols
+                // Convert Vec<String> to Vec<&str>
+                let symbol_refs: Vec<&str> = symbols.iter().map(|s| s.as_str()).collect();
+                if let Err(e) = client.subscribe(None, None, Some(&symbol_refs)).await {
+                    eprintln!("❌ Failed to subscribe to bars: {}", e);
+                    let _ = sender.send(StreamUpdate::Error(format!(
+                        "Failed to subscribe to bars: {}",
+                        e
+                    )));
+                    let _ = sender.send(StreamUpdate::MarketDataDisconnected);
+                    return;
+                }
+
+                println!("✅ Subscribed to bars for {:?}", symbols);
+
+                // Process messages
+                loop {
+                    match client.next_message().await {
+                        Ok(Some(messages)) => {
+                            // next_message() returns Vec<MarketDataMessage>
+                            for message in messages {
+                                if let Some(update) = process_market_data_message(message) {
+                                    if sender.send(update).is_err() {
+                                        println!(
+                                            "❌ Failed to send market data update to UI (channel closed)"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Control frame or unparsable message
+                            continue;
+                        }
+                        Err(e) => {
+                            // Check if it's a serialization error (unsupported message type)
+                            let error_str = e.to_string();
+                            if error_str.contains("Serialization error")
+                                || error_str.contains("Unsupported message type")
+                            {
+                                println!(
+                                    "⚠️  Skipping unsupported market data message type: {}",
+                                    error_str
+                                );
+                                continue;
+                            }
+
+                            eprintln!("❌ Error receiving market data message: {}", e);
+                            let _ = sender.send(StreamUpdate::Error(format!(
+                                "Market data stream error: {}",
+                                e
+                            )));
+
+                            // Try to reconnect after a delay
+                            println!("🔄 Attempting to reconnect market data stream in 5 seconds...");
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+                            match client.connect().await {
+                                Ok(_) => {
+                                    println!("✅ Market data reconnected successfully!");
+                                    let _ = sender.send(StreamUpdate::MarketDataConnected);
+
+                                    // Re-subscribe to bars
+                                    let symbol_refs: Vec<&str> = symbols.iter().map(|s| s.as_str()).collect();
+                                    if let Err(e) = client.subscribe(None, None, Some(&symbol_refs)).await {
+                                        eprintln!("❌ Failed to re-subscribe to bars: {}", e);
+                                        let _ = sender.send(StreamUpdate::MarketDataDisconnected);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("❌ Market data reconnection failed: {}", e);
+                                    let _ = sender.send(StreamUpdate::MarketDataDisconnected);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                println!("🛑 Market Data WebSocket stream task ended");
+            })
+        })
+    }
+}
+
+/// Process incoming market data WebSocket messages and convert to StreamUpdate
+fn process_market_data_message(
+    message: alpaca_markets::wss::market_data::MarketDataMessage,
+) -> Option<StreamUpdate> {
+    use alpaca_markets::wss::market_data::MarketDataMessage;
+
+    match message {
+        MarketDataMessage::Bar(bar) => {
+            println!(
+                "📊 Bar Update: {} @ {} - O:{} H:{} L:{} C:{} V:{}",
+                bar.symbol, bar.timestamp, bar.open, bar.high, bar.low, bar.close, bar.volume
+            );
+
+            Some(StreamUpdate::BarUpdate(BarUpdate {
+                symbol: bar.symbol,
+                timestamp: bar.timestamp.to_rfc3339(),
+                open: bar.open.to_string(),
+                high: bar.high.to_string(),
+                low: bar.low.to_string(),
+                close: bar.close.to_string(),
+                volume: bar.volume.to_string(),
+                trade_count: Some(bar.trade_count),
+                vwap: Some(bar.vwap.to_string()),
+            }))
+        }
+        MarketDataMessage::Trade(trade) => {
+            println!(
+                "💹 Trade: {} @ {} - Price: {}, Size: {}",
+                trade.symbol, trade.timestamp, trade.price, trade.size
+            );
+            None // Not handling trades yet
+        }
+        MarketDataMessage::Quote(quote) => {
+            println!(
+                "💱 Quote: {} @ {} - Bid: {}, Ask: {}",
+                quote.symbol, quote.timestamp, quote.bid_price, quote.ask_price
+            );
+            None // Not handling quotes yet
+        }
+        MarketDataMessage::Subscription(sub) => {
+            println!("👂 Market Data Subscriptions: {:?}", sub);
+            None
+        }
+        MarketDataMessage::Error(error) => {
+            eprintln!("❌ Market Data Error: {:?}", error);
+            Some(StreamUpdate::Error(format!(
+                "Market Data Error: {:?}",
+                error
+            )))
+        }
     }
 }

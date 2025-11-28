@@ -14,6 +14,13 @@ A professional stock trading terminal built with Rust and GPUI, featuring real-t
 - Automatic order list cleanup (filled/canceled orders removed)
 - WebSocket keepalive with auto-reconnection
 
+📊 **Real-Time Market Data (WebSocket)**
+- Live bar updates (candlestick data) streamed in real-time
+- Subscribe to multiple symbols simultaneously
+- Automatic reconnection on disconnect
+- Visual connection indicator showing last update time
+- Support for trades, quotes, and bars (bars enabled by default)
+
 💰 **Live Account Data**
 - Real-time buying power updates
 - Live cash balance tracking
@@ -38,7 +45,9 @@ A professional stock trading terminal built with Rust and GPUI, featuring real-t
 - Dark theme optimized for long viewing sessions
 - Clean, professional design
 - Responsive layout with tabs (Account, Positions, Orders)
-- Visual WebSocket connection indicator (🟢 Live Updates)
+- Dual WebSocket connection indicators:
+  - 🟢 Live Updates (Trading WebSocket)
+  - 📊 Market Data (Market Data WebSocket with last bar time)
 
 ## Prerequisites
 
@@ -86,9 +95,14 @@ cargo run
 
 ### 3. Verify Connection
 
-Look for these indicators:
-- Console: `✅ Connected to trading stream!`
-- UI: `🟢 Live Updates` (green indicator in header)
+Look for these indicators in the console:
+- `✅ Connected to trading stream!`
+- `✅ Connected to market data stream!`
+- `✅ Subscribed to bars for ["AAPL"]`
+
+Look for these indicators in the UI:
+- `🟢 Live Updates` (green indicator for trading WebSocket)
+- `📊 Market Data (Last: HH:MM:SS)` (blue indicator for market data WebSocket)
 
 ## Usage
 
@@ -143,8 +157,9 @@ This is normal and means your connection is healthy!
 **Header:**
 - Symbol input and timeframe selector
 - Refresh button for manual chart reload
-- 🟢 "Live Updates" = WebSocket connected
-- ⭕ "Disconnected" = No real-time updates
+- 🟢 "Live Updates" = Trading WebSocket connected
+- 📊 "Market Data (Last: XX:XX:XX)" = Market Data WebSocket connected and receiving bars
+- ⭕ "Disconnected" / "📊 No Market Data" = No real-time updates
 
 **Chart:**
 - Candlestick visualization with live data
@@ -179,13 +194,17 @@ alpaca_markets_terminal/
 
 ### WebSocket Real-Time Updates
 
-The terminal uses Alpaca's Trading WebSocket stream for real-time updates:
+The terminal uses two separate Alpaca WebSocket streams:
+
+1. **Trading WebSocket** - Order and account updates
+2. **Market Data WebSocket** - Real-time bars, trades, and quotes
 
 **Architecture:**
-- WebSocket runs in dedicated OS thread with Tokio runtime
+- Each WebSocket runs in dedicated OS thread with Tokio runtime
 - GPUI uses its own async runtime (not Tokio)
-- Communication via unbounded mpsc channel
+- Communication via unbounded mpsc channels
 - Auto-reconnection on disconnect (5-second delay)
+- IEX feed for market data (real-time during market hours)
 
 **Order Lifecycle:**
 ```
@@ -205,6 +224,25 @@ All transitions happen instantly in the UI via WebSocket events.
 - Ping/Pong messages handled automatically
 - Keepalive every 30-60 seconds
 - Connection health monitoring
+
+### Market Data WebSocket
+
+**Subscribed Data:**
+- Bars (1-minute candlestick data) for current symbol
+- Updates during market hours (9:30 AM - 4:00 PM ET)
+- Real-time price, volume, and VWAP data
+
+**Message Types:**
+- `Bar` - OHLCV candlestick data (primary)
+- `Trade` - Individual trades (logged, not displayed)
+- `Quote` - Bid/ask updates (logged, not displayed)
+- `Subscription` - Confirmation of subscribed streams
+- `Error` - Error messages from API
+
+**Data Flow:**
+```
+Market Data Stream → BarUpdate → UI Update → Display last bar time
+```
 
 ## Troubleshooting
 
@@ -296,11 +334,18 @@ This project is provided as-is for educational purposes.
 
 **Successful Connection:**
 ```
-🚀 Starting WebSocket stream connection...
+🚀 Starting Alpaca Trading WebSocket stream...
 ✅ Configuration loaded from environment variables
 🔌 Connecting to Alpaca Trading WebSocket...
 ✅ Connected to trading stream!
 👂 Subscribed to: ["trade_updates"]
+
+🚀 Starting Alpaca Market Data WebSocket stream...
+📊 Subscribing to bars for symbols: ["AAPL"]
+✅ Market Data configuration loaded from environment variables
+🔌 Connecting to Alpaca Market Data WebSocket...
+✅ Connected to market data stream!
+✅ Subscribed to bars for ["AAPL"]
 ```
 
 **Order Flow:**
@@ -312,6 +357,16 @@ This project is provided as-is for educational purposes.
 🔄 Trade Update: fill - Order abc123 (AAPL) is now filled
 🗑️  Removed filled order abc123 from list
 💰 Account Update: Buying Power: $49950.00
+```
+
+**Market Data Flow:**
+```
+📊 Bar Update: AAPL @ 2024-01-15T14:30:00Z - O:185.50 H:185.75 L:185.40 C:185.65 V:125000
+📊 Received bar update for: AAPL
+✓ Bar updated for AAPL - O:185.50 H:185.75 L:185.40 C:185.65 V:125000 @ 2024-01-15T14:30:00Z
+
+💹 Trade: AAPL @ 2024-01-15T14:30:15Z - Price: 185.66, Size: 100
+💱 Quote: AAPL @ 2024-01-15T14:30:16Z - Bid: 185.65, Ask: 185.66
 ```
 
 ## Disclaimer
@@ -334,11 +389,13 @@ If you encounter issues:
 
 - Built with [GPUI](https://www.gpui.rs/) - Modern GPU-accelerated UI framework from Zed
 - Powered by [Alpaca Markets](https://alpaca.markets/) - Commission-free trading API
-- WebSocket real-time updates via Alpaca Trading Stream
+- Dual WebSocket streams:
+  - Trading Stream for order/account updates
+  - Market Data Stream (IEX feed) for real-time bars
 - Inspired by professional trading terminals
 
 ---
 
 **Made with ❤️ and Rust**
 
-*Real-time trading terminal with WebSocket streaming - Production Ready! 🚀*
+*Real-time trading terminal with dual WebSocket streaming - Production Ready! 🚀*
