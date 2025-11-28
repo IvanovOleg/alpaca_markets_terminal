@@ -646,10 +646,6 @@ impl BarChart {
                 .child(div().text_color(rgb(0x808080)).child(message));
         }
 
-        let chart_width = 1200.0_f32;
-        let chart_height = 600.0_f32;
-        let padding = 60.0_f32;
-
         // Calculate price range
         let max_price = self
             .bars
@@ -668,33 +664,32 @@ impl BarChart {
         let adjusted_min = min_price - price_padding;
         let adjusted_range = adjusted_max - adjusted_min;
 
-        let candle_width = (chart_width - 2.0 * padding) / self.bars.len() as f32;
-        let candle_spacing = candle_width * 0.3;
-        let actual_candle_width = (candle_width - candle_spacing).max(2.0);
-
         div()
             .flex()
             .flex_col()
             .gap_4()
+            .size_full()
             .child(
-                // Chart container
+                // Chart container - fills available space and maintains aspect ratio
                 div()
-                    .w(px(chart_width))
-                    .h(px(chart_height))
+                    .flex()
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(300.0))
                     .bg(rgb(0x1a1a1a))
                     .border_2()
                     .border_color(rgb(0x404040))
                     .relative()
                     .overflow_hidden()
-                    // Price grid lines
+                    // Price grid lines - using percentage positioning
                     .children((0..6).map(|i| {
-                        let y = padding + (i as f32 / 5.0) * (chart_height - 2.0 * padding);
+                        let y_percent = 10.0 + (i as f32 / 5.0) * 80.0;
                         let price = adjusted_max - (i as f64 / 5.0) * adjusted_range;
 
                         div()
                             .absolute()
                             .left(px(0.0))
-                            .top(px(y))
+                            .top(gpui::rems((y_percent / 100.0) * 30.0))
                             .w_full()
                             .h(px(1.0))
                             .bg(rgb(0x2a2a2a))
@@ -708,26 +703,24 @@ impl BarChart {
                                     .child(format!("${:.2}", price)),
                             )
                     }))
-                    // Candlesticks
+                    // Candlesticks - using percentage-based positioning
                     .children(self.bars.iter().enumerate().map(|(i, bar)| {
-                        let x = padding + i as f32 * candle_width;
+                        // Calculate positions as percentages (10% padding on each side = 80% usable)
+                        let x_percent = 10.0 + (i as f32 / self.bars.len() as f32) * 80.0;
+                        let candle_width_percent = (80.0 / self.bars.len() as f32).max(0.3);
 
-                        // Calculate Y positions (inverted because canvas origin is top-left)
-                        let high_y = padding
-                            + ((adjusted_max - bar.high) / adjusted_range) as f32
-                                * (chart_height - 2.0 * padding);
-                        let low_y = padding
-                            + ((adjusted_max - bar.low) / adjusted_range) as f32
-                                * (chart_height - 2.0 * padding);
-                        let open_y = padding
-                            + ((adjusted_max - bar.open) / adjusted_range) as f32
-                                * (chart_height - 2.0 * padding);
-                        let close_y = padding
-                            + ((adjusted_max - bar.close) / adjusted_range) as f32
-                                * (chart_height - 2.0 * padding);
+                        // Calculate Y positions as percentages (10% padding top/bottom)
+                        let high_percent =
+                            10.0 + ((adjusted_max - bar.high) / adjusted_range) as f32 * 80.0;
+                        let low_percent =
+                            10.0 + ((adjusted_max - bar.low) / adjusted_range) as f32 * 80.0;
+                        let open_percent =
+                            10.0 + ((adjusted_max - bar.open) / adjusted_range) as f32 * 80.0;
+                        let close_percent =
+                            10.0 + ((adjusted_max - bar.close) / adjusted_range) as f32 * 80.0;
 
-                        let body_top = open_y.min(close_y);
-                        let body_height = (open_y - close_y).abs().max(1.0);
+                        let body_top_percent = open_percent.min(close_percent);
+                        let body_height_percent = (open_percent - close_percent).abs().max(0.1);
 
                         // Determine if bullish or bearish
                         let is_bullish = bar.close >= bar.open;
@@ -743,22 +736,22 @@ impl BarChart {
                             .child(
                                 div()
                                     .absolute()
-                                    .left(px(
-                                        x + candle_spacing / 2.0 + actual_candle_width / 2.0 - 0.5
+                                    .left(gpui::rems(
+                                        (x_percent + candle_width_percent * 0.35) / 100.0 * 80.0,
                                     ))
-                                    .top(px(high_y))
+                                    .top(gpui::rems((high_percent / 100.0) * 30.0))
                                     .w(px(1.0))
-                                    .h(px(low_y - high_y))
+                                    .h(gpui::rems(((low_percent - high_percent) / 100.0) * 30.0))
                                     .bg(color),
                             )
                             // Open-Close body (thicker rectangle)
                             .child(
                                 div()
                                     .absolute()
-                                    .left(px(x + candle_spacing / 2.0))
-                                    .top(px(body_top))
-                                    .w(px(actual_candle_width))
-                                    .h(px(body_height))
+                                    .left(gpui::rems((x_percent / 100.0) * 80.0))
+                                    .top(gpui::rems((body_top_percent / 100.0) * 30.0))
+                                    .w(gpui::rems((candle_width_percent * 0.7 / 100.0) * 80.0))
+                                    .h(gpui::rems((body_height_percent / 100.0) * 30.0))
                                     .bg(fill_color)
                                     .border_1()
                                     .border_color(color),
