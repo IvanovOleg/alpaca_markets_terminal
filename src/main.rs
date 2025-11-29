@@ -1,5 +1,5 @@
 use alpaca_markets::{
-    AlpacaConfig, Bar, MarketDataClient, TradingClient,
+    Adjustment, AlpacaConfig, Bar, MarketDataClient, Sort, TradingClient,
     models::{OrderSide, OrderTimeInForce, OrderType},
 };
 use chrono::{Duration, Utc};
@@ -87,8 +87,14 @@ struct BarChart {
     last_bar_time: Option<String>,
     // Crosshair tracking
     mouse_window_position: Option<gpui::Point<gpui::Pixels>>,
-    chart_bounds: Option<gpui::Bounds<gpui::Pixels>>,
     show_crosshair: bool,
+    // Bar limit
+    bar_limit: String,
+    bar_limit_focused: bool,
+    // Chart scroll offset
+    chart_scroll_offset: f32,
+    // Bars per screen (for zoom control)
+    bars_per_screen: usize,
 }
 
 impl BarChart {
@@ -128,17 +134,11 @@ impl BarChart {
             market_data_connected: false,
             last_bar_time: None,
             mouse_window_position: None,
-            chart_bounds: Some(gpui::Bounds {
-                origin: gpui::Point {
-                    x: px(34.0),
-                    y: px(220.0),
-                },
-                size: gpui::Size {
-                    width: px(1.0),
-                    height: px(1.0),
-                },
-            }),
             show_crosshair: false,
+            bar_limit: "100".to_string(),
+            bar_limit_focused: false,
+            chart_scroll_offset: 0.0,
+            bars_per_screen: 100,
         };
 
         // Fetch data on startup
@@ -605,18 +605,18 @@ impl BarChart {
     fn fetch_bars(&mut self, cx: &mut Context<Self>) {
         self.loading = true;
         self.error = None;
-        self.bars.clear();
         cx.notify();
 
         let symbol = self.symbol.clone();
         let timeframe = self.timeframe.clone();
+        let limit = self.bar_limit.parse::<u32>().unwrap_or(100);
 
         // Modern GPUI async pattern with AsyncApp::update()
         cx.spawn(async move |this, cx| {
             // Run the blocking API call in a background thread
             let result = cx
                 .background_executor()
-                .spawn(async move { fetch_bars_sync(&symbol, &timeframe) })
+                .spawn(async move { fetch_bars_sync(&symbol, &timeframe, limit) })
                 .await;
 
             // Update UI using AsyncApp::update()
@@ -625,11 +625,36 @@ impl BarChart {
                     Ok(bars) => {
                         chart.bars = bars;
                         chart.error = None;
+                        // Set scroll offset to show most recent bars by default
+                        chart.chart_scroll_offset =
+                            chart.bars.len().saturating_sub(chart.bars_per_screen) as f32;
                         println!(
-                            "✓ Successfully loaded {} bars for {}",
+                            "✓ Successfully loaded {} bars for {} ({})",
                             chart.bars.len(),
-                            chart.symbol
+                            chart.symbol,
+                            chart.timeframe
                         );
+                        // Debug: Show first and last bar prices with timestamps
+                        if !chart.bars.is_empty() {
+                            let first = &chart.bars[0];
+                            let last = &chart.bars[chart.bars.len() - 1];
+                            println!(
+                                "  First bar: O:{:.2} H:{:.2} L:{:.2} C:{:.2} ({})",
+                                first.open,
+                                first.high,
+                                first.low,
+                                first.close,
+                                first.timestamp.format("%Y-%m-%d %H:%M")
+                            );
+                            println!(
+                                "  Last bar:  O:{:.2} H:{:.2} L:{:.2} C:{:.2} ({})",
+                                last.open,
+                                last.high,
+                                last.low,
+                                last.close,
+                                last.timestamp.format("%Y-%m-%d %H:%M")
+                            );
+                        }
                     }
                     Err(error) => {
                         chart.error = Some(error.clone());
@@ -644,6 +669,99 @@ impl BarChart {
         .detach();
     }
 
+    // Helper function to calculate nice round grid values
+    fn calculate_round_grid_values(min: f64, max: f64, target_count: usize) -> Vec<f64> {
+        let range = max - min;
+        if range <= 0.0 {
+            return vec![min];
+        }
+
+        // Try different step sizes to find one that gives us close to target_count
+        let rough_step = range / target_count as f64;
+        let magnitude = 10_f64.powf(rough_step.log10().floor());
+
+        // Enforce minimum step size to prevent bunching - at least 1/20th of the range
+        let min_step = range / 20.0;
+
+        // Try multiple step size candidates in order of preference
+        // Include more intermediate values to prevent jumping (e.g., 20 -> 50)
+        let candidates = vec![
+            magnitude * 1.0,
+            magnitude * 2.0,
+            magnitude * 2.5,
+            magnitude * 4.0,
+            magnitude * 5.0,
+            magnitude * 10.0,
+            magnitude * 0.5,
+        ];
+
+        // Filter out steps that are too small
+        let candidates: Vec<f64> = candidates
+            .into_iter()
+            .filter(|&step| step >= min_step)
+            .collect();
+
+        // If all candidates are too small, just use the minimum step
+        let candidates = if candidates.is_empty() {
+            vec![min_step]
+        } else {
+            candidates
+        };
+
+        let mut best_values = Vec::new();
+        let mut best_diff = usize::MAX;
+
+        for &step in &candidates {
+            let start = (min / step).floor() * step;
+            let mut values = Vec::new();
+            let mut current = start;
+
+            while current <= max + step * 0.5 {
+                if current >= min - step * 0.1 {
+                    values.push(current);
+                }
+                current += step;
+                if values.len() > target_count * 2 {
+                    break;
+                }
+            }
+
+            // Filter to only include values within the actual range
+            values.retain(|&v| v >= min && v <= max);
+
+            // Check how close we are to the target count
+            let diff = if values.len() >= target_count {
+                values.len() - target_count
+            } else {
+                (target_count - values.len()) * 3 // Heavily penalize having too few lines
+            };
+
+            // Prefer this step if it's closer to target and has enough values
+            // Strongly prefer smaller steps (earlier in candidates list) when close to target
+            let is_better = if values.len() >= target_count.saturating_sub(1) {
+                // If we have enough lines, prefer smaller step even if diff is slightly worse
+                diff <= best_diff || best_values.len() < target_count
+            } else {
+                diff < best_diff
+            };
+
+            if values.len() >= target_count / 2 && is_better {
+                best_diff = diff;
+                best_values = values;
+            }
+        }
+
+        // Ensure we have at least 2 values
+        if best_values.is_empty() {
+            best_values.push(min);
+            best_values.push(max);
+        } else if best_values.len() == 1 {
+            best_values.push(best_values[0] + rough_step);
+        }
+
+        best_values
+    }
+
     fn render_candlesticks(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.bars.is_empty() {
             let message = if self.loading {
@@ -655,21 +773,33 @@ impl BarChart {
             };
 
             return div()
-                .flex()
+                .grid()
                 .items_center()
                 .justify_center()
                 .size_full()
                 .child(div().text_color(rgb(0x808080)).child(message));
         }
 
-        // Calculate price range
-        let max_price = self
-            .bars
+        // Calculate visible range of bars (windowing for scrolling)
+        let bars_per_screen = self.bars_per_screen;
+        // Clamp start_index to valid range
+        let start_index =
+            (self.chart_scroll_offset as usize).min(self.bars.len().saturating_sub(1));
+        let end_index = (start_index + bars_per_screen).min(self.bars.len());
+        // Ensure we don't have an empty range
+        let start_index = if end_index > start_index {
+            start_index
+        } else {
+            0
+        };
+        let visible_bars = &self.bars[start_index..end_index];
+
+        // Calculate price range for visible bars only
+        let max_price = visible_bars
             .iter()
             .map(|b| b.close)
             .fold(f64::NEG_INFINITY, f64::max);
-        let min_price = self
-            .bars
+        let min_price = visible_bars
             .iter()
             .map(|b| b.close)
             .fold(f64::INFINITY, f64::min);
@@ -680,99 +810,182 @@ impl BarChart {
         let adjusted_min = min_price - price_padding;
         let adjusted_range = adjusted_max - adjusted_min;
 
+        // Calculate bar width based on visible bars with padding
+        let padding_left_percent = 5.0; // 5% left padding
+        let padding_right_percent = 5.0; // 5% right padding
+        let usable_width_percent = 100.0 - padding_left_percent - padding_right_percent;
+
+        let visible_bar_count = visible_bars.len() as f32;
+        let bar_spacing_ratio = 0.2; // 20% spacing between bars
+        let bar_width_percent =
+            (usable_width_percent / visible_bar_count) * (1.0 - bar_spacing_ratio);
+        let total_bar_width_percent = usable_width_percent / visible_bar_count;
+
         div()
             .flex()
             .flex_col()
             .gap_4()
             .size_full()
             .child(
-                // Chart container - fills available space and maintains aspect ratio
+                // Chart container - expands to fill available space
                 div()
                     .id("chart-container")
-                    .flex()
+                    .relative()
                     .flex_1()
                     .w_full()
-                    .min_h(px(300.0))
                     .bg(rgb(0x1a1a1a))
                     .border_2()
                     .border_color(rgb(0x404040))
-                    .relative()
-                    .overflow_hidden()
-                    .on_mouse_move(cx.listener(
-                        |this, event: &gpui::MouseMoveEvent, _window, cx| {
-                            // Calculate relative position using stored bounds
-                            if let Some(bounds) = this.chart_bounds {
-                                let relative_x = event.position.x - bounds.origin.x;
-                                let relative_y = event.position.y - bounds.origin.y;
+                    .on_scroll_wheel(cx.listener(
+                        |this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                            let pixel_delta = event.delta.pixel_delta(px(1.0));
+                            let scroll_amount: f32 = pixel_delta.y.into();
 
-                                this.mouse_window_position = Some(gpui::Point {
-                                    x: relative_x,
-                                    y: relative_y,
-                                });
-                                this.show_crosshair = true;
+                            // Check if Ctrl is pressed for zoom
+                            if event.modifiers.control {
+                                // Zoom: adjust bars_per_screen
+                                let zoom_amount = (scroll_amount * 2.0) as i32;
+
+                                if zoom_amount > 0 {
+                                    // Zoom out (show more bars)
+                                    this.bars_per_screen = (this.bars_per_screen
+                                        + zoom_amount as usize)
+                                        .min(this.bars.len());
+                                } else {
+                                    // Zoom in (show fewer bars)
+                                    this.bars_per_screen =
+                                        (this.bars_per_screen as i32 + zoom_amount).max(10)
+                                            as usize;
+                                }
+
+                                // Adjust scroll offset to keep it in bounds
+                                let max_offset =
+                                    this.bars.len().saturating_sub(this.bars_per_screen) as f32;
+                                this.chart_scroll_offset = this.chart_scroll_offset.min(max_offset);
                             } else {
-                                // Store window position as-is for first frame
-                                this.mouse_window_position = Some(event.position);
-                                this.show_crosshair = true;
+                                // Normal scroll: move through bars
+                                let max_offset =
+                                    this.bars.len().saturating_sub(this.bars_per_screen) as f32;
+                                let scroll_amount = scroll_amount * 0.5; // Adjust sensitivity
+
+                                if scroll_amount > 0.0 {
+                                    // Scroll forward (show older bars)
+                                    this.chart_scroll_offset =
+                                        (this.chart_scroll_offset + scroll_amount).min(max_offset);
+                                } else {
+                                    // Scroll backward (show newer bars)
+                                    this.chart_scroll_offset =
+                                        (this.chart_scroll_offset + scroll_amount).max(0.0);
+                                }
                             }
+
                             cx.notify();
                         },
                     ))
-                    .on_mouse_down(
-                        gpui::MouseButton::Middle,
-                        cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
-                            // Middle-click to set chart origin at current mouse position
-                            this.chart_bounds = Some(gpui::Bounds {
-                                origin: event.position,
-                                size: gpui::Size {
-                                    width: px(1.0),
-                                    height: px(1.0),
-                                },
-                            });
-                            println!("Chart origin set to: {:?}", event.position);
-                            cx.notify();
-                        }),
-                    )
-                    // Price grid lines - using percentage positioning
-                    .children((0..6).map(|i| {
-                        let y_percent = 10.0 + (i as f32 / 5.0) * 80.0;
-                        let price = adjusted_max - (i as f64 / 5.0) * adjusted_range;
+                    // Price grid lines with round values (adaptive to zoom level)
+                    .children({
+                        // Adjust grid line count based on zoom level
+                        let grid_count = if self.bars_per_screen <= 20 {
+                            12 // Very zoomed in - show many grid lines
+                        } else if self.bars_per_screen <= 50 {
+                            10 // Moderately zoomed in
+                        } else if self.bars_per_screen <= 100 {
+                            8 // Default zoom
+                        } else if self.bars_per_screen <= 200 {
+                            6 // Zoomed out
+                        } else if self.bars_per_screen <= 500 {
+                            5 // More zoomed out
+                        } else {
+                            4 // Very zoomed out - show fewer grid lines
+                        };
 
+                        let grid_values = Self::calculate_round_grid_values(
+                            adjusted_min,
+                            adjusted_max,
+                            grid_count,
+                        );
+                        grid_values.into_iter().map(|price| {
+                            // Calculate Y position as percentage
+                            let y_percent =
+                                ((adjusted_max - price) / adjusted_range) as f32 * 100.0;
+
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top(gpui::relative(y_percent / 100.0))
+                                .w_full()
+                                .h(px(1.0))
+                                .bg(rgb(0x2a2a2a))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(5.0))
+                                        .top(px(-8.0))
+                                        .text_xs()
+                                        .text_color(rgb(0x808080))
+                                        .child(format!("${:.2}", price)),
+                                )
+                        })
+                    })
+                    // Candlestick wicks
+                    .children(visible_bars.iter().enumerate().map(|(i, bar)| {
+                        // Calculate positions as percentages with padding
+                        let x_percent = padding_left_percent + i as f32 * total_bar_width_percent;
+
+                        // Calculate Y positions as percentages with padding
+                        let padding_top_percent = 5.0;
+                        let padding_bottom_percent = 5.0;
+                        let usable_height_percent =
+                            100.0 - padding_top_percent - padding_bottom_percent;
+
+                        let high_y_percent = padding_top_percent
+                            + ((adjusted_max - bar.high) / adjusted_range) as f32
+                                * usable_height_percent;
+                        let low_y_percent = padding_top_percent
+                            + ((adjusted_max - bar.low) / adjusted_range) as f32
+                                * usable_height_percent;
+
+                        let wick_height_percent = low_y_percent - high_y_percent;
+
+                        // Determine if bullish or bearish
+                        let is_bullish = bar.close >= bar.open;
+                        let color = if is_bullish {
+                            rgb(0x00cc66)
+                        } else {
+                            rgb(0xff4444)
+                        };
+
+                        // High-Low wick (thin line)
                         div()
                             .absolute()
-                            .left(px(0.0))
-                            .top(gpui::rems((y_percent / 100.0) * 30.0))
-                            .w_full()
-                            .h(px(1.0))
-                            .bg(rgb(0x2a2a2a))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(5.0))
-                                    .top(px(-8.0))
-                                    .text_xs()
-                                    .text_color(rgb(0x808080))
-                                    .child(format!("${:.2}", price)),
-                            )
+                            .left(gpui::relative(
+                                (x_percent + bar_width_percent / 2.0) / 100.0,
+                            ))
+                            .top(gpui::relative(high_y_percent / 100.0))
+                            .w(px(1.0))
+                            .h(gpui::relative(wick_height_percent / 100.0))
+                            .bg(color)
                     }))
-                    // Candlesticks - using percentage-based positioning
-                    .children(self.bars.iter().enumerate().map(|(i, bar)| {
-                        // Calculate positions as percentages (10% padding on each side = 80% usable)
-                        let x_percent = 10.0 + (i as f32 / self.bars.len() as f32) * 80.0;
-                        let candle_width_percent = (80.0 / self.bars.len() as f32).max(0.3);
+                    // Candlestick bodies
+                    .children(visible_bars.iter().enumerate().map(|(i, bar)| {
+                        // Calculate positions as percentages with padding
+                        let x_percent = padding_left_percent + i as f32 * total_bar_width_percent;
 
-                        // Calculate Y positions as percentages (10% padding top/bottom)
-                        let high_percent =
-                            10.0 + ((adjusted_max - bar.high) / adjusted_range) as f32 * 80.0;
-                        let low_percent =
-                            10.0 + ((adjusted_max - bar.low) / adjusted_range) as f32 * 80.0;
-                        let open_percent =
-                            10.0 + ((adjusted_max - bar.open) / adjusted_range) as f32 * 80.0;
-                        let close_percent =
-                            10.0 + ((adjusted_max - bar.close) / adjusted_range) as f32 * 80.0;
+                        // Calculate Y positions as percentages with padding
+                        let padding_top_percent = 5.0;
+                        let padding_bottom_percent = 5.0;
+                        let usable_height_percent =
+                            100.0 - padding_top_percent - padding_bottom_percent;
 
-                        let body_top_percent = open_percent.min(close_percent);
-                        let body_height_percent = (open_percent - close_percent).abs().max(0.1);
+                        let open_y_percent = padding_top_percent
+                            + ((adjusted_max - bar.open) / adjusted_range) as f32
+                                * usable_height_percent;
+                        let close_y_percent = padding_top_percent
+                            + ((adjusted_max - bar.close) / adjusted_range) as f32
+                                * usable_height_percent;
+
+                        let body_top_percent = open_y_percent.min(close_y_percent);
+                        let body_height_percent = (open_y_percent - close_y_percent).abs().max(0.1);
 
                         // Determine if bullish or bearish
                         let is_bullish = bar.close >= bar.open;
@@ -782,80 +995,100 @@ impl BarChart {
                             (rgb(0xff4444), rgb(0xff4444))
                         };
 
+                        // Open-Close body (thicker rectangle)
                         div()
                             .absolute()
-                            // High-Low wick (thin line)
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(gpui::rems(
-                                        (x_percent + candle_width_percent * 0.35) / 100.0 * 80.0,
-                                    ))
-                                    .top(gpui::rems((high_percent / 100.0) * 30.0))
-                                    .w(px(1.0))
-                                    .h(gpui::rems(((low_percent - high_percent) / 100.0) * 30.0))
-                                    .bg(color),
+                            .left(gpui::relative(x_percent / 100.0))
+                            .top(gpui::relative(body_top_percent / 100.0))
+                            .w(gpui::relative(bar_width_percent / 100.0))
+                            .h(gpui::relative(body_height_percent / 100.0))
+                            .bg(fill_color)
+                            .border_1()
+                            .border_color(color)
+                    })),
+            )
+            .child(
+                // Scroll controls
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .justify_center()
+                    .p_2()
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .bg(rgb(0x2a2a2a))
+                            .border_1()
+                            .border_color(rgb(0x404040))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x3a3a3a)))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
+                                    if this.chart_scroll_offset > 0.0 {
+                                        this.chart_scroll_offset =
+                                            (this.chart_scroll_offset - 50.0).max(0.0);
+                                        cx.notify();
+                                    }
+                                }),
                             )
-                            // Open-Close body (thicker rectangle)
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(gpui::rems((x_percent / 100.0) * 80.0))
-                                    .top(gpui::rems((body_top_percent / 100.0) * 30.0))
-                                    .w(gpui::rems((candle_width_percent * 0.7 / 100.0) * 80.0))
-                                    .h(gpui::rems((body_height_percent / 100.0) * 30.0))
-                                    .bg(fill_color)
-                                    .border_1()
-                                    .border_color(color),
-                            )
-                    }))
-                    // Background overlay for exact mouse detection
-                    .child(div().absolute().inset_0().on_mouse_move(cx.listener(
-                        |this, _event, _window, cx| {
-                            // This ensures crosshair stays visible while over chart
-                            // (already handled by parent's on_mouse_move)
-                            cx.notify();
-                        },
+                            .child("← Previous 50"),
+                    )
+                    .child(div().text_sm().text_color(rgb(0x808080)).child(format!(
+                        "Showing bars {}-{} of {} | Zoom: {} bars",
+                        start_index + 1,
+                        end_index,
+                        self.bars.len(),
+                        self.bars_per_screen
                     )))
-                    // Crosshair rendering - only shown when show_crosshair is true
-                    .children(
-                        if self.show_crosshair && self.mouse_window_position.is_some() {
-                            let mouse_pos = self.mouse_window_position.unwrap();
-                            vec![
-                                // Vertical crosshair line
-                                div()
-                                    .absolute()
-                                    .left(mouse_pos.x)
-                                    .top(px(0.0))
-                                    .w(px(1.5))
-                                    .h_full()
-                                    .bg(gpui::rgba(0xFFFFFF60))
-                                    .into_any_element(),
-                                // Horizontal crosshair line
-                                div()
-                                    .absolute()
-                                    .left(px(0.0))
-                                    .top(mouse_pos.y)
-                                    .w_full()
-                                    .h(px(1.5))
-                                    .bg(gpui::rgba(0xFFFFFF60))
-                                    .into_any_element(),
-                                // Crosshair indicator
-                                div()
-                                    .absolute()
-                                    .left(mouse_pos.x - px(3.0))
-                                    .top(mouse_pos.y - px(3.0))
-                                    .w(px(6.0))
-                                    .h(px(6.0))
-                                    .rounded(px(3.0))
-                                    .bg(gpui::rgba(0xFFFFFFCC))
-                                    .border_1()
-                                    .border_color(rgb(0x1f6feb))
-                                    .into_any_element(),
-                            ]
-                        } else {
-                            vec![]
-                        },
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .bg(rgb(0x2a2a2a))
+                            .border_1()
+                            .border_color(rgb(0x404040))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x3a3a3a)))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
+                                    let max_offset =
+                                        this.bars.len().saturating_sub(this.bars_per_screen) as f32;
+                                    if this.chart_scroll_offset < max_offset {
+                                        this.chart_scroll_offset =
+                                            (this.chart_scroll_offset + 50.0).min(max_offset);
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .child("Next 50 →"),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .bg(rgb(0x1f6feb))
+                            .border_1()
+                            .border_color(rgb(0x404040))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x2a7ffc)))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
+                                    // Show most recent bars
+                                    this.chart_scroll_offset =
+                                        this.bars.len().saturating_sub(this.bars_per_screen) as f32;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("Show Latest →→"),
                     ),
             )
             .child(
@@ -905,15 +1138,19 @@ impl Render for BarChart {
         };
 
         div()
-            .flex()
+            .grid()
+            .grid_cols(8)
+            .grid_rows(1)
             .bg(rgb(0x0d1117))
             .size_full()
+            .min_w(px(1024.0))
+            .gap_4()
             .child(
-                // Main content area
+                // Main content area (left column) - flex layout for header/chart/footer
                 div()
+                    .col_span(7)
                     .flex()
                     .flex_col()
-                    .flex_1()
                     .p_8()
                     .gap_6()
                     .track_focus(&self.focus_handle)
@@ -986,11 +1223,34 @@ impl Render for BarChart {
                             }
                             return;
                         }
+
+                        // Handle bar limit input
+                        if this.bar_limit_focused {
+                            let key = event.keystroke.key.as_str();
+
+                            if key == "enter" {
+                                this.bar_limit_focused = false;
+                                cx.notify();
+                            } else if key == "backspace" {
+                                this.bar_limit.pop();
+                                cx.notify();
+                            } else if key == "escape" {
+                                this.bar_limit_focused = false;
+                                cx.notify();
+                            } else if let Some(key_char) = &event.keystroke.key_char {
+                                if key_char.len() == 1 && key_char.chars().all(|c| c.is_numeric()) {
+                                    this.bar_limit.push_str(key_char);
+                                    cx.notify();
+                                }
+                            }
+                            return;
+                        }
                     }))
                     .child(
                         // Header
                         div()
                             .flex()
+                            .flex_shrink_0()
                             .items_center()
                             .justify_between()
                             .on_mouse_move(cx.listener(|this, _event, _window, cx| {
@@ -999,6 +1259,189 @@ impl Render for BarChart {
                                 cx.notify();
                             }))
                             .child(
+                                // Controls: Symbol input and Timeframe selector
+                                div()
+                                    .flex()
+                                    .gap_4()
+                                    .items_end()
+                                    .child(
+                                        // Symbol input
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(0xffffff))
+                                                    .child("Symbol:"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .id("symbol-input")
+                                                            .px_4()
+                                                            .py_2()
+                                                            .bg(if self.input_focused {
+                                                                rgb(0x1f2937)
+                                                            } else {
+                                                                rgb(0x161b22)
+                                                            })
+                                                            .border_1()
+                                                            .border_color(if self.input_focused {
+                                                                rgb(0x1f6feb)
+                                                            } else {
+                                                                rgb(0x30363d)
+                                                            })
+                                                            .rounded_lg()
+                                                            .text_color(rgb(0xffffff))
+                                                            .min_w(px(120.0))
+                                                            .cursor_text()
+                                                            .child(if self.input_focused {
+                                                                format!("{}|", self.symbol_input)
+                                                            } else if self.symbol_input.is_empty() {
+                                                                "Enter symbol...".to_string()
+                                                            } else {
+                                                                self.symbol_input.clone()
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |this, _, _window, cx| {
+                                                                    this.input_focused = true;
+                                                                    _window
+                                                                        .focus(&this.focus_handle);
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("update-symbol-button")
+                                                            .px_4()
+                                                            .py_2()
+                                                            .bg(rgb(0x1f6feb))
+                                                            .rounded_lg()
+                                                            .text_color(rgb(0xffffff))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .cursor_pointer()
+                                                            .hover(|style| style.bg(rgb(0x388bfd)))
+                                                            .child("Update")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.submit_symbol(cx);
+                                                                },
+                                                            )),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        // Timeframe selector
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(0xffffff))
+                                                    .child("Timeframe:"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .gap_2()
+                                                    .child(
+                                                        self.render_timeframe_button(
+                                                            "1Min", "1m", cx,
+                                                        ),
+                                                    )
+                                                    .child(
+                                                        self.render_timeframe_button(
+                                                            "5Min", "5m", cx,
+                                                        ),
+                                                    )
+                                                    .child(self.render_timeframe_button(
+                                                        "15Min", "15m", cx,
+                                                    ))
+                                                    .child(
+                                                        self.render_timeframe_button(
+                                                            "1Hour", "1h", cx,
+                                                        ),
+                                                    )
+                                                    .child(
+                                                        self.render_timeframe_button(
+                                                            "1Day", "1D", cx,
+                                                        ),
+                                                    )
+                                                    .child(
+                                                        self.render_timeframe_button(
+                                                            "1Week", "1W", cx,
+                                                        ),
+                                                    )
+                                                    .child(self.render_timeframe_button(
+                                                        "1Month", "1M", cx,
+                                                    )),
+                                            ),
+                                    )
+                                    .child(
+                                        // Bar limit input
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(0xffffff))
+                                                    .child("Bars:"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("bar-limit-input")
+                                                    .px_4()
+                                                    .py_2()
+                                                    .bg(if self.bar_limit_focused {
+                                                        rgb(0x1f2937)
+                                                    } else {
+                                                        rgb(0x161b22)
+                                                    })
+                                                    .border_1()
+                                                    .border_color(if self.bar_limit_focused {
+                                                        rgb(0x1f6feb)
+                                                    } else {
+                                                        rgb(0x30363d)
+                                                    })
+                                                    .rounded_lg()
+                                                    .text_color(rgb(0xffffff))
+                                                    .min_w(px(80.0))
+                                                    .cursor_text()
+                                                    .child(if self.bar_limit_focused {
+                                                        format!("{}|", self.bar_limit)
+                                                    } else if self.bar_limit.is_empty() {
+                                                        "100".to_string()
+                                                    } else {
+                                                        self.bar_limit.clone()
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        |this, _, _window, cx| {
+                                                            this.bar_limit_focused = true;
+                                                            this.input_focused = false;
+                                                            this.quantity_focused = false;
+                                                            this.price_focused = false;
+                                                            _window.focus(&this.focus_handle);
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                // Title section
                                 div()
                                     .flex()
                                     .flex_col()
@@ -1018,6 +1461,71 @@ impl Render for BarChart {
                                     )),
                             )
                             .child(
+                                // Status and controls section
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    .child(
+                                        // WebSocket Status Indicator
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_4()
+                                            .py_3()
+                                            .rounded_lg()
+                                            .bg(if self.stream_connected {
+                                                rgb(0x238636)
+                                            } else {
+                                                rgb(0x6e7681)
+                                            })
+                                            .child(
+                                                div().text_sm().text_color(rgb(0xffffff)).child(
+                                                    if self.stream_connected {
+                                                        "🟢 Live Updates"
+                                                    } else {
+                                                        "⭕ Disconnected"
+                                                    },
+                                                ),
+                                            ),
+                                    )
+                                    .child(
+                                        // Market Data WebSocket Status Indicator
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_4()
+                                            .py_3()
+                                            .rounded_lg()
+                                            .bg(if self.market_data_connected {
+                                                rgb(0x1f6feb)
+                                            } else {
+                                                rgb(0x6e7681)
+                                            })
+                                            .child(
+                                                div().text_sm().text_color(rgb(0xffffff)).child(
+                                                    if self.market_data_connected {
+                                                        if let Some(ref last_time) =
+                                                            self.last_bar_time
+                                                        {
+                                                            format!(
+                                                                "📊 Market Data (Last: {})",
+                                                                &last_time[11..19]
+                                                            ) // Show just HH:MM:SS
+                                                        } else {
+                                                            "📊 Market Data".to_string()
+                                                        }
+                                                    } else {
+                                                        "📊 No Market Data".to_string()
+                                                    },
+                                                ),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                // Refresh button
                                 div()
                                     .id("refresh-button")
                                     .px_6()
@@ -1036,178 +1544,24 @@ impl Render for BarChart {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.fetch_bars(cx);
                                     })),
-                            )
-                            .child(
-                                // WebSocket Status Indicator
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .px_4()
-                                    .py_3()
-                                    .rounded_lg()
-                                    .bg(if self.stream_connected {
-                                        rgb(0x238636)
-                                    } else {
-                                        rgb(0x6e7681)
-                                    })
-                                    .child(div().text_sm().text_color(rgb(0xffffff)).child(
-                                        if self.stream_connected {
-                                            "🟢 Live Updates"
-                                        } else {
-                                            "⭕ Disconnected"
-                                        },
-                                    )),
-                            )
-                            .child(
-                                // Market Data WebSocket Status Indicator
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .px_4()
-                                    .py_3()
-                                    .rounded_lg()
-                                    .bg(if self.market_data_connected {
-                                        rgb(0x1f6feb)
-                                    } else {
-                                        rgb(0x6e7681)
-                                    })
-                                    .child(div().text_sm().text_color(rgb(0xffffff)).child(
-                                        if self.market_data_connected {
-                                            if let Some(ref last_time) = self.last_bar_time {
-                                                format!(
-                                                    "📊 Market Data (Last: {})",
-                                                    &last_time[11..19]
-                                                ) // Show just HH:MM:SS
-                                            } else {
-                                                "📊 Market Data".to_string()
-                                            }
-                                        } else {
-                                            "📊 No Market Data".to_string()
-                                        },
-                                    )),
-                            ),
-                    )
-                    .child(
-                        // Controls: Symbol input and Timeframe selector
-                        div()
-                            .flex()
-                            .gap_4()
-                            .items_end()
-                            .child(
-                                // Symbol input
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(0xffffff))
-                                            .child("Symbol:"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .id("symbol-input")
-                                                    .px_4()
-                                                    .py_2()
-                                                    .bg(if self.input_focused {
-                                                        rgb(0x1f2937)
-                                                    } else {
-                                                        rgb(0x161b22)
-                                                    })
-                                                    .border_1()
-                                                    .border_color(if self.input_focused {
-                                                        rgb(0x1f6feb)
-                                                    } else {
-                                                        rgb(0x30363d)
-                                                    })
-                                                    .rounded_lg()
-                                                    .text_color(rgb(0xffffff))
-                                                    .min_w(px(120.0))
-                                                    .cursor_text()
-                                                    .child(if self.input_focused {
-                                                        format!("{}|", self.symbol_input)
-                                                    } else if self.symbol_input.is_empty() {
-                                                        "Enter symbol...".to_string()
-                                                    } else {
-                                                        self.symbol_input.clone()
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        |this, _, _window, cx| {
-                                                            this.input_focused = true;
-                                                            _window.focus(&this.focus_handle);
-                                                            cx.notify();
-                                                        },
-                                                    )),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("update-symbol-button")
-                                                    .px_4()
-                                                    .py_2()
-                                                    .bg(rgb(0x1f6feb))
-                                                    .rounded_lg()
-                                                    .text_color(rgb(0xffffff))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .cursor_pointer()
-                                                    .hover(|style| style.bg(rgb(0x388bfd)))
-                                                    .child("Update")
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.submit_symbol(cx);
-                                                    })),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                // Timeframe selector
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(0xffffff))
-                                            .child("Timeframe:"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .gap_2()
-                                            .child(self.render_timeframe_button("1Min", "1m", cx))
-                                            .child(self.render_timeframe_button("5Min", "5m", cx))
-                                            .child(self.render_timeframe_button("15Min", "15m", cx))
-                                            .child(self.render_timeframe_button("1Hour", "1h", cx))
-                                            .child(self.render_timeframe_button("1Day", "1D", cx))
-                                            .child(self.render_timeframe_button("1Week", "1W", cx))
-                                            .child(
-                                                self.render_timeframe_button("1Month", "1M", cx),
-                                            ),
-                                    ),
                             ),
                     )
                     .child(
                         // Chart area
                         div()
-                            .flex()
                             .flex_1()
+                            .grid()
                             .items_center()
                             .justify_center()
+                            .min_h(px(400.0))
                             .child(self.render_candlesticks(cx)),
                     )
                     .child(
                         // Tabbed Footer
                         div()
-                            .flex()
-                            .flex_col()
+                            .flex_shrink_0()
+                            .grid()
+                            .grid_cols(1)
                             .gap_3()
                             .p_4()
                             .bg(rgb(0x161b22))
@@ -1380,12 +1734,11 @@ impl Render for BarChart {
                                 div.child(self.render_orders_tab(cx))
                             }),
                     ),
-            )
+            ) // Close main content .child()
             .child(
                 // Right sidebar - Order form
                 div()
-                    .w(px(320.0))
-                    .h_full()
+                    .col_span(1)
                     .bg(rgb(0x161b22))
                     .border_l_1()
                     .border_color(rgb(0x30363d))
@@ -1733,7 +2086,7 @@ impl BarChart {
     fn render_positions_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.positions_loading {
             return div()
-                .flex()
+                .grid()
                 .items_center()
                 .justify_center()
                 .p_6()
@@ -1743,7 +2096,7 @@ impl BarChart {
 
         if self.positions.is_empty() {
             return div()
-                .flex()
+                .grid()
                 .items_center()
                 .justify_center()
                 .p_6()
@@ -1752,8 +2105,8 @@ impl BarChart {
         }
 
         div()
-            .flex()
-            .flex_col()
+            .grid()
+            .grid_cols(1)
             .gap_2()
             .child(
                 // Table header
@@ -1921,7 +2274,7 @@ impl BarChart {
     fn render_orders_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.orders_loading {
             return div()
-                .flex()
+                .grid()
                 .items_center()
                 .justify_center()
                 .p_6()
@@ -1931,7 +2284,7 @@ impl BarChart {
 
         if self.orders.is_empty() {
             return div()
-                .flex()
+                .grid()
                 .items_center()
                 .justify_center()
                 .p_6()
@@ -1940,8 +2293,8 @@ impl BarChart {
         }
 
         div()
-            .flex()
-            .flex_col()
+            .grid()
+            .grid_cols(1)
             .gap_2()
             .child(
                 // Table header
@@ -2575,7 +2928,8 @@ fn close_position_sync(symbol: String) -> Result<(), String> {
 }
 
 // Synchronous function to fetch bars (runs in background thread)
-fn fetch_bars_sync(symbol: &str, timeframe: &str) -> Result<Vec<Bar>, String> {
+// Uses split-adjusted data with sort=desc to get most recent bars
+fn fetch_bars_sync(symbol: &str, timeframe: &str, user_limit: u32) -> Result<Vec<Bar>, String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
 
     rt.block_on(async {
@@ -2592,31 +2946,47 @@ fn fetch_bars_sync(symbol: &str, timeframe: &str) -> Result<Vec<Bar>, String> {
 
         let client = MarketDataClient::new(config);
 
-        // Fetch bars based on timeframe
+        // Calculate time range - use generous lookback since we'll sort descending
         let end_time = Utc::now();
-        let (start_time, limit) = match timeframe {
-            "1Min" => (end_time - Duration::hours(24), Some(100)),
-            "5Min" => (end_time - Duration::days(5), Some(100)),
-            "15Min" => (end_time - Duration::days(10), Some(100)),
-            "1Hour" => (end_time - Duration::days(30), Some(100)),
-            "1Day" => (end_time - Duration::days(200), Some(100)),
-            "1Week" => (end_time - Duration::days(700), Some(100)),
-            "1Month" => (end_time - Duration::days(2500), Some(100)),
-            _ => (end_time - Duration::days(200), Some(100)),
+        let start_time = match timeframe {
+            // Intraday: calculate days needed based on bars/day during market hours
+            "1Min" => end_time - Duration::days(((user_limit as i64) / 390).max(1) + 2),
+            "5Min" => end_time - Duration::days(((user_limit as i64) / 78).max(1) + 2),
+            "15Min" => end_time - Duration::days(((user_limit as i64) / 26).max(1) + 2),
+            "1Hour" => end_time - Duration::days(((user_limit as i64) / 6).max(1) + 5),
+            // Daily+: straightforward calculation with buffer for weekends/holidays
+            "1Day" => end_time - Duration::days((user_limit as i64 * 3) / 2),
+            "1Week" => end_time - Duration::days((user_limit as i64 * 7) + 14),
+            "1Month" => end_time - Duration::days((user_limit as i64 * 30) + 60),
+            _ => end_time - Duration::days((user_limit as i64 * 3) / 2),
         };
 
+        // Use Sort::Desc to get most recent bars first, with split adjustment
+        // The API will return the most recent N bars when sorted descending
         let result = client
-            .get_bars(symbol, timeframe, Some(start_time), Some(end_time), limit)
+            .get_bars(
+                symbol,
+                timeframe,
+                Some(start_time),
+                Some(end_time),
+                Some(user_limit),
+                Some(Sort::Desc),        // Sort descending to get most recent bars
+                Some(Adjustment::Split), // Adjust for stock splits
+            )
             .await;
 
         match result {
-            Ok(bars_response) => Ok(bars_response.bars),
+            Ok(bars_response) => {
+                // Reverse bars to chronological order (oldest first) for chart rendering
+                let mut bars = bars_response.bars;
+                bars.reverse();
+                Ok(bars)
+            }
             Err(e) => Err(format!("Error fetching data: {:?}", e)),
         }
     })
 }
 
-// Generate mock data for demonstration
 fn generate_mock_data() -> Vec<Bar> {
     let mut bars = Vec::new();
     let base_price = 150.0;
