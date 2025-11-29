@@ -86,7 +86,7 @@ struct BarChart {
     market_data_connected: bool,
     last_bar_time: Option<String>,
     // Crosshair tracking
-    mouse_window_position: Option<gpui::Point<gpui::Pixels>>,
+    mouse_position: Option<gpui::Point<gpui::Pixels>>,
     show_crosshair: bool,
     // Bar limit
     bar_limit: String,
@@ -133,7 +133,7 @@ impl BarChart {
             stream_status: "Disconnected".to_string(),
             market_data_connected: false,
             last_bar_time: None,
-            mouse_window_position: None,
+            mouse_position: None,
             show_crosshair: false,
             bar_limit: "100".to_string(),
             bar_limit_focused: false,
@@ -836,176 +836,233 @@ impl BarChart {
                     .bg(rgb(0x1a1a1a))
                     .border_2()
                     .border_color(rgb(0x404040))
-                    .on_scroll_wheel(cx.listener(
-                        |this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                            let pixel_delta = event.delta.pixel_delta(px(1.0));
-                            let scroll_amount: f32 = pixel_delta.y.into();
+                    // Inner div with relative positioning for accurate mouse tracking
+                    .child(
+                        div()
+                            .relative()
+                            .size_full()
+                            .overflow_hidden()
+                            .on_mouse_move(cx.listener(
+                                |this, event: &gpui::MouseMoveEvent, _window, cx| {
+                                    // Fixed offset calibration - adjust these values if needed
+                                    let offset_x = px(66.0); // Adjust this value
+                                    let offset_y = px(212.0); // Adjust this value
 
-                            // Check if Ctrl is pressed for zoom
-                            if event.modifiers.control {
-                                // Zoom: adjust bars_per_screen
-                                let zoom_amount = (scroll_amount * 2.0) as i32;
+                                    let relative_x = event.position.x - offset_x;
+                                    let relative_y = event.position.y - offset_y;
 
-                                if zoom_amount > 0 {
-                                    // Zoom out (show more bars)
-                                    this.bars_per_screen = (this.bars_per_screen
-                                        + zoom_amount as usize)
-                                        .min(this.bars.len());
+                                    this.mouse_position = Some(gpui::Point {
+                                        x: relative_x,
+                                        y: relative_y,
+                                    });
+                                    this.show_crosshair = true;
+                                    cx.notify();
+                                },
+                            ))
+                            .on_scroll_wheel(cx.listener(
+                                |this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                                    let pixel_delta = event.delta.pixel_delta(px(1.0));
+                                    let scroll_amount: f32 = pixel_delta.y.into();
+
+                                    // Check if Ctrl is pressed for zoom
+                                    if event.modifiers.control {
+                                        // Zoom: adjust bars_per_screen
+                                        let zoom_amount = (scroll_amount * 2.0) as i32;
+
+                                        if zoom_amount > 0 {
+                                            // Zoom out (show more bars)
+                                            this.bars_per_screen = (this.bars_per_screen
+                                                + zoom_amount as usize)
+                                                .min(this.bars.len());
+                                        } else {
+                                            // Zoom in (show fewer bars)
+                                            this.bars_per_screen =
+                                                (this.bars_per_screen as i32 + zoom_amount).max(10)
+                                                    as usize;
+                                        }
+
+                                        // Adjust scroll offset to keep it in bounds
+                                        let max_offset =
+                                            this.bars.len().saturating_sub(this.bars_per_screen)
+                                                as f32;
+                                        this.chart_scroll_offset =
+                                            this.chart_scroll_offset.min(max_offset);
+                                    } else {
+                                        // Normal scroll: move through bars
+                                        let max_offset =
+                                            this.bars.len().saturating_sub(this.bars_per_screen)
+                                                as f32;
+                                        let scroll_amount = scroll_amount * 0.5; // Adjust sensitivity
+
+                                        if scroll_amount > 0.0 {
+                                            // Scroll forward (show older bars)
+                                            this.chart_scroll_offset = (this.chart_scroll_offset
+                                                + scroll_amount)
+                                                .min(max_offset);
+                                        } else {
+                                            // Scroll backward (show newer bars)
+                                            this.chart_scroll_offset =
+                                                (this.chart_scroll_offset + scroll_amount).max(0.0);
+                                        }
+                                    }
+
+                                    cx.notify();
+                                },
+                            ))
+                            // Price grid lines with round values (adaptive to zoom level)
+                            .children({
+                                // Adjust grid line count based on zoom level
+                                let grid_count = if self.bars_per_screen <= 20 {
+                                    12 // Very zoomed in - show many grid lines
+                                } else if self.bars_per_screen <= 50 {
+                                    10 // Moderately zoomed in
+                                } else if self.bars_per_screen <= 100 {
+                                    8 // Default zoom
+                                } else if self.bars_per_screen <= 200 {
+                                    6 // Zoomed out
+                                } else if self.bars_per_screen <= 500 {
+                                    5 // More zoomed out
                                 } else {
-                                    // Zoom in (show fewer bars)
-                                    this.bars_per_screen =
-                                        (this.bars_per_screen as i32 + zoom_amount).max(10)
-                                            as usize;
-                                }
+                                    4 // Very zoomed out - show fewer grid lines
+                                };
 
-                                // Adjust scroll offset to keep it in bounds
-                                let max_offset =
-                                    this.bars.len().saturating_sub(this.bars_per_screen) as f32;
-                                this.chart_scroll_offset = this.chart_scroll_offset.min(max_offset);
-                            } else {
-                                // Normal scroll: move through bars
-                                let max_offset =
-                                    this.bars.len().saturating_sub(this.bars_per_screen) as f32;
-                                let scroll_amount = scroll_amount * 0.5; // Adjust sensitivity
+                                let grid_values = Self::calculate_round_grid_values(
+                                    adjusted_min,
+                                    adjusted_max,
+                                    grid_count,
+                                );
+                                grid_values.into_iter().map(|price| {
+                                    // Calculate Y position as percentage
+                                    let y_percent =
+                                        ((adjusted_max - price) / adjusted_range) as f32 * 100.0;
 
-                                if scroll_amount > 0.0 {
-                                    // Scroll forward (show older bars)
-                                    this.chart_scroll_offset =
-                                        (this.chart_scroll_offset + scroll_amount).min(max_offset);
-                                } else {
-                                    // Scroll backward (show newer bars)
-                                    this.chart_scroll_offset =
-                                        (this.chart_scroll_offset + scroll_amount).max(0.0);
-                                }
-                            }
-
-                            cx.notify();
-                        },
-                    ))
-                    // Price grid lines with round values (adaptive to zoom level)
-                    .children({
-                        // Adjust grid line count based on zoom level
-                        let grid_count = if self.bars_per_screen <= 20 {
-                            12 // Very zoomed in - show many grid lines
-                        } else if self.bars_per_screen <= 50 {
-                            10 // Moderately zoomed in
-                        } else if self.bars_per_screen <= 100 {
-                            8 // Default zoom
-                        } else if self.bars_per_screen <= 200 {
-                            6 // Zoomed out
-                        } else if self.bars_per_screen <= 500 {
-                            5 // More zoomed out
-                        } else {
-                            4 // Very zoomed out - show fewer grid lines
-                        };
-
-                        let grid_values = Self::calculate_round_grid_values(
-                            adjusted_min,
-                            adjusted_max,
-                            grid_count,
-                        );
-                        grid_values.into_iter().map(|price| {
-                            // Calculate Y position as percentage
-                            let y_percent =
-                                ((adjusted_max - price) / adjusted_range) as f32 * 100.0;
-
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top(gpui::relative(y_percent / 100.0))
-                                .w_full()
-                                .h(px(1.0))
-                                .bg(rgb(0x2a2a2a))
-                                .child(
                                     div()
                                         .absolute()
-                                        .left(px(5.0))
-                                        .top(px(-8.0))
-                                        .text_xs()
-                                        .text_color(rgb(0x808080))
-                                        .child(format!("${:.2}", price)),
-                                )
-                        })
-                    })
-                    // Candlestick wicks
-                    .children(visible_bars.iter().enumerate().map(|(i, bar)| {
-                        // Calculate positions as percentages with padding
-                        let x_percent = padding_left_percent + i as f32 * total_bar_width_percent;
+                                        .left_0()
+                                        .top(gpui::relative(y_percent / 100.0))
+                                        .w_full()
+                                        .h(px(1.0))
+                                        .bg(rgb(0x2a2a2a))
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(5.0))
+                                                .top(px(-8.0))
+                                                .text_xs()
+                                                .text_color(rgb(0x808080))
+                                                .child(format!("${:.2}", price)),
+                                        )
+                                })
+                            })
+                            // Candlestick wicks
+                            .children(visible_bars.iter().enumerate().map(|(i, bar)| {
+                                // Calculate positions as percentages with padding
+                                let x_percent =
+                                    padding_left_percent + i as f32 * total_bar_width_percent;
 
-                        // Calculate Y positions as percentages with padding
-                        let padding_top_percent = 5.0;
-                        let padding_bottom_percent = 5.0;
-                        let usable_height_percent =
-                            100.0 - padding_top_percent - padding_bottom_percent;
+                                // Calculate Y positions as percentages with padding
+                                let padding_top_percent = 5.0;
+                                let padding_bottom_percent = 5.0;
+                                let usable_height_percent =
+                                    100.0 - padding_top_percent - padding_bottom_percent;
 
-                        let high_y_percent = padding_top_percent
-                            + ((adjusted_max - bar.high) / adjusted_range) as f32
-                                * usable_height_percent;
-                        let low_y_percent = padding_top_percent
-                            + ((adjusted_max - bar.low) / adjusted_range) as f32
-                                * usable_height_percent;
+                                let high_y_percent = padding_top_percent
+                                    + ((adjusted_max - bar.high) / adjusted_range) as f32
+                                        * usable_height_percent;
+                                let low_y_percent = padding_top_percent
+                                    + ((adjusted_max - bar.low) / adjusted_range) as f32
+                                        * usable_height_percent;
 
-                        let wick_height_percent = low_y_percent - high_y_percent;
+                                let wick_height_percent = low_y_percent - high_y_percent;
 
-                        // Determine if bullish or bearish
-                        let is_bullish = bar.close >= bar.open;
-                        let color = if is_bullish {
-                            rgb(0x00cc66)
-                        } else {
-                            rgb(0xff4444)
-                        };
+                                // Determine if bullish or bearish
+                                let is_bullish = bar.close >= bar.open;
+                                let color = if is_bullish {
+                                    rgb(0x00cc66)
+                                } else {
+                                    rgb(0xff4444)
+                                };
 
-                        // High-Low wick (thin line)
-                        div()
-                            .absolute()
-                            .left(gpui::relative(
-                                (x_percent + bar_width_percent / 2.0) / 100.0,
-                            ))
-                            .top(gpui::relative(high_y_percent / 100.0))
-                            .w(px(1.0))
-                            .h(gpui::relative(wick_height_percent / 100.0))
-                            .bg(color)
-                    }))
-                    // Candlestick bodies
-                    .children(visible_bars.iter().enumerate().map(|(i, bar)| {
-                        // Calculate positions as percentages with padding
-                        let x_percent = padding_left_percent + i as f32 * total_bar_width_percent;
+                                // High-Low wick (thin line)
+                                div()
+                                    .absolute()
+                                    .left(gpui::relative(
+                                        (x_percent + bar_width_percent / 2.0) / 100.0,
+                                    ))
+                                    .top(gpui::relative(high_y_percent / 100.0))
+                                    .w(px(1.0))
+                                    .h(gpui::relative(wick_height_percent / 100.0))
+                                    .bg(color)
+                            }))
+                            // Candlestick bodies
+                            .children(visible_bars.iter().enumerate().map(|(i, bar)| {
+                                // Calculate positions as percentages with padding
+                                let x_percent =
+                                    padding_left_percent + i as f32 * total_bar_width_percent;
 
-                        // Calculate Y positions as percentages with padding
-                        let padding_top_percent = 5.0;
-                        let padding_bottom_percent = 5.0;
-                        let usable_height_percent =
-                            100.0 - padding_top_percent - padding_bottom_percent;
+                                // Calculate Y positions as percentages with padding
+                                let padding_top_percent = 5.0;
+                                let padding_bottom_percent = 5.0;
+                                let usable_height_percent =
+                                    100.0 - padding_top_percent - padding_bottom_percent;
 
-                        let open_y_percent = padding_top_percent
-                            + ((adjusted_max - bar.open) / adjusted_range) as f32
-                                * usable_height_percent;
-                        let close_y_percent = padding_top_percent
-                            + ((adjusted_max - bar.close) / adjusted_range) as f32
-                                * usable_height_percent;
+                                let open_y_percent = padding_top_percent
+                                    + ((adjusted_max - bar.open) / adjusted_range) as f32
+                                        * usable_height_percent;
+                                let close_y_percent = padding_top_percent
+                                    + ((adjusted_max - bar.close) / adjusted_range) as f32
+                                        * usable_height_percent;
 
-                        let body_top_percent = open_y_percent.min(close_y_percent);
-                        let body_height_percent = (open_y_percent - close_y_percent).abs().max(0.1);
+                                let body_top_percent = open_y_percent.min(close_y_percent);
+                                let body_height_percent =
+                                    (open_y_percent - close_y_percent).abs().max(0.1);
 
-                        // Determine if bullish or bearish
-                        let is_bullish = bar.close >= bar.open;
-                        let (color, fill_color) = if is_bullish {
-                            (rgb(0x00cc66), rgb(0x00cc66))
-                        } else {
-                            (rgb(0xff4444), rgb(0xff4444))
-                        };
+                                // Determine if bullish or bearish
+                                let is_bullish = bar.close >= bar.open;
+                                let (color, fill_color) = if is_bullish {
+                                    (rgb(0x00cc66), rgb(0x00cc66))
+                                } else {
+                                    (rgb(0xff4444), rgb(0xff4444))
+                                };
 
-                        // Open-Close body (thicker rectangle)
-                        div()
-                            .absolute()
-                            .left(gpui::relative(x_percent / 100.0))
-                            .top(gpui::relative(body_top_percent / 100.0))
-                            .w(gpui::relative(bar_width_percent / 100.0))
-                            .h(gpui::relative(body_height_percent / 100.0))
-                            .bg(fill_color)
-                            .border_1()
-                            .border_color(color)
-                    })),
+                                // Open-Close body (thicker rectangle)
+                                div()
+                                    .absolute()
+                                    .left(gpui::relative(x_percent / 100.0))
+                                    .top(gpui::relative(body_top_percent / 100.0))
+                                    .w(gpui::relative(bar_width_percent / 100.0))
+                                    .h(gpui::relative(body_height_percent / 100.0))
+                                    .bg(fill_color)
+                                    .border_1()
+                                    .border_color(color)
+                            }))
+                            // Crosshair overlay
+                            .children(if self.show_crosshair && self.mouse_position.is_some() {
+                                let mouse_pos = self.mouse_position.unwrap();
+                                vec![
+                                    // Vertical crosshair line
+                                    div()
+                                        .absolute()
+                                        .left(mouse_pos.x)
+                                        .top(px(0.0))
+                                        .w(px(1.0))
+                                        .h(gpui::relative(1.0))
+                                        .bg(gpui::rgba(0xFFFFFF40))
+                                        .into_any_element(),
+                                    // Horizontal crosshair line
+                                    div()
+                                        .absolute()
+                                        .left(px(0.0))
+                                        .top(mouse_pos.y)
+                                        .w(gpui::relative(1.0))
+                                        .h(px(1.0))
+                                        .bg(gpui::rgba(0xFFFFFF40))
+                                        .into_any_element(),
+                                ]
+                            } else {
+                                vec![]
+                            }),
+                    ),
             )
             .child(
                 // Scroll controls
@@ -1016,6 +1073,11 @@ impl BarChart {
                     .items_center()
                     .justify_center()
                     .p_2()
+                    .on_mouse_move(cx.listener(|this, _event, _window, cx| {
+                        // Hide crosshair when mouse is over scroll controls
+                        this.show_crosshair = false;
+                        cx.notify();
+                    }))
                     .child(
                         div()
                             .px_3()
@@ -1098,11 +1160,6 @@ impl BarChart {
                     .gap_6()
                     .text_sm()
                     .text_color(rgb(0xcccccc))
-                    .on_mouse_move(cx.listener(|this, _event, _window, cx| {
-                        // Hide crosshair when over price statistics
-                        this.show_crosshair = false;
-                        cx.notify();
-                    }))
                     .child(div().child(format!("High: ${:.2}", max_price)))
                     .child(div().child(format!("Low: ${:.2}", min_price)))
                     .child(div().child(format!("Range: ${:.2}", price_range)))
@@ -1547,14 +1604,57 @@ impl Render for BarChart {
                             ),
                     )
                     .child(
-                        // Chart area
+                        // Spacer div between header and chart to catch mouse events in the gap
+                        div().h(px(24.0)).w_full().on_mouse_move(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.show_crosshair = false;
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        // Chart area wrapper with side padding to catch mouse events
                         div()
                             .flex_1()
-                            .grid()
-                            .items_center()
-                            .justify_center()
+                            .flex()
+                            .flex_row()
                             .min_h(px(400.0))
-                            .child(self.render_candlesticks(cx)),
+                            .child(
+                                // Left padding area to catch mouse events
+                                div().w(px(32.0)).h_full().on_mouse_move(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.show_crosshair = false;
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                // Actual chart
+                                div()
+                                    .flex_1()
+                                    .grid()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(self.render_candlesticks(cx)),
+                            )
+                            .child(
+                                // Right padding area to catch mouse events
+                                div().w(px(32.0)).h_full().on_mouse_move(cx.listener(
+                                    |this, _event, _window, cx| {
+                                        this.show_crosshair = false;
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        // Spacer div between chart and footer to catch mouse events in the gap
+                        div().h(px(24.0)).w_full().on_mouse_move(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.show_crosshair = false;
+                                cx.notify();
+                            },
+                        )),
                     )
                     .child(
                         // Tabbed Footer
@@ -1746,6 +1846,11 @@ impl Render for BarChart {
                     .flex()
                     .flex_col()
                     .gap_4()
+                    .on_mouse_move(cx.listener(|this, _event, _window, cx| {
+                        // Hide crosshair when mouse is over sidebar
+                        this.show_crosshair = false;
+                        cx.notify();
+                    }))
                     .child(
                         div()
                             .text_lg()
