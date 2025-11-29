@@ -85,6 +85,10 @@ struct BarChart {
     // Market data stream
     market_data_connected: bool,
     last_bar_time: Option<String>,
+    // Crosshair tracking
+    mouse_window_position: Option<gpui::Point<gpui::Pixels>>,
+    chart_bounds: Option<gpui::Bounds<gpui::Pixels>>,
+    show_crosshair: bool,
 }
 
 impl BarChart {
@@ -123,6 +127,18 @@ impl BarChart {
             stream_status: "Disconnected".to_string(),
             market_data_connected: false,
             last_bar_time: None,
+            mouse_window_position: None,
+            chart_bounds: Some(gpui::Bounds {
+                origin: gpui::Point {
+                    x: px(34.0),
+                    y: px(220.0),
+                },
+                size: gpui::Size {
+                    width: px(1.0),
+                    height: px(1.0),
+                },
+            }),
+            show_crosshair: false,
         };
 
         // Fetch data on startup
@@ -628,7 +644,7 @@ impl BarChart {
         .detach();
     }
 
-    fn render_candlesticks(&self) -> impl IntoElement {
+    fn render_candlesticks(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.bars.is_empty() {
             let message = if self.loading {
                 "Loading data from Alpaca Markets...".to_string()
@@ -672,6 +688,7 @@ impl BarChart {
             .child(
                 // Chart container - fills available space and maintains aspect ratio
                 div()
+                    .id("chart-container")
                     .flex()
                     .flex_1()
                     .w_full()
@@ -681,6 +698,41 @@ impl BarChart {
                     .border_color(rgb(0x404040))
                     .relative()
                     .overflow_hidden()
+                    .on_mouse_move(cx.listener(
+                        |this, event: &gpui::MouseMoveEvent, _window, cx| {
+                            // Calculate relative position using stored bounds
+                            if let Some(bounds) = this.chart_bounds {
+                                let relative_x = event.position.x - bounds.origin.x;
+                                let relative_y = event.position.y - bounds.origin.y;
+
+                                this.mouse_window_position = Some(gpui::Point {
+                                    x: relative_x,
+                                    y: relative_y,
+                                });
+                                this.show_crosshair = true;
+                            } else {
+                                // Store window position as-is for first frame
+                                this.mouse_window_position = Some(event.position);
+                                this.show_crosshair = true;
+                            }
+                            cx.notify();
+                        },
+                    ))
+                    .on_mouse_down(
+                        gpui::MouseButton::Middle,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
+                            // Middle-click to set chart origin at current mouse position
+                            this.chart_bounds = Some(gpui::Bounds {
+                                origin: event.position,
+                                size: gpui::Size {
+                                    width: px(1.0),
+                                    height: px(1.0),
+                                },
+                            });
+                            println!("Chart origin set to: {:?}", event.position);
+                            cx.notify();
+                        }),
+                    )
                     // Price grid lines - using percentage positioning
                     .children((0..6).map(|i| {
                         let y_percent = 10.0 + (i as f32 / 5.0) * 80.0;
@@ -756,7 +808,55 @@ impl BarChart {
                                     .border_1()
                                     .border_color(color),
                             )
-                    })),
+                    }))
+                    // Background overlay for exact mouse detection
+                    .child(div().absolute().inset_0().on_mouse_move(cx.listener(
+                        |this, _event, _window, cx| {
+                            // This ensures crosshair stays visible while over chart
+                            // (already handled by parent's on_mouse_move)
+                            cx.notify();
+                        },
+                    )))
+                    // Crosshair rendering - only shown when show_crosshair is true
+                    .children(
+                        if self.show_crosshair && self.mouse_window_position.is_some() {
+                            let mouse_pos = self.mouse_window_position.unwrap();
+                            vec![
+                                // Vertical crosshair line
+                                div()
+                                    .absolute()
+                                    .left(mouse_pos.x)
+                                    .top(px(0.0))
+                                    .w(px(1.5))
+                                    .h_full()
+                                    .bg(gpui::rgba(0xFFFFFF60))
+                                    .into_any_element(),
+                                // Horizontal crosshair line
+                                div()
+                                    .absolute()
+                                    .left(px(0.0))
+                                    .top(mouse_pos.y)
+                                    .w_full()
+                                    .h(px(1.5))
+                                    .bg(gpui::rgba(0xFFFFFF60))
+                                    .into_any_element(),
+                                // Crosshair indicator
+                                div()
+                                    .absolute()
+                                    .left(mouse_pos.x - px(3.0))
+                                    .top(mouse_pos.y - px(3.0))
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(gpui::rgba(0xFFFFFFCC))
+                                    .border_1()
+                                    .border_color(rgb(0x1f6feb))
+                                    .into_any_element(),
+                            ]
+                        } else {
+                            vec![]
+                        },
+                    ),
             )
             .child(
                 // Price statistics
@@ -765,6 +865,11 @@ impl BarChart {
                     .gap_6()
                     .text_sm()
                     .text_color(rgb(0xcccccc))
+                    .on_mouse_move(cx.listener(|this, _event, _window, cx| {
+                        // Hide crosshair when over price statistics
+                        this.show_crosshair = false;
+                        cx.notify();
+                    }))
                     .child(div().child(format!("High: ${:.2}", max_price)))
                     .child(div().child(format!("Low: ${:.2}", min_price)))
                     .child(div().child(format!("Range: ${:.2}", price_range)))
@@ -888,6 +993,11 @@ impl Render for BarChart {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .on_mouse_move(cx.listener(|this, _event, _window, cx| {
+                                // Hide crosshair when mouse is over header
+                                this.show_crosshair = false;
+                                cx.notify();
+                            }))
                             .child(
                                 div()
                                     .flex()
@@ -1091,7 +1201,7 @@ impl Render for BarChart {
                             .flex_1()
                             .items_center()
                             .justify_center()
-                            .child(self.render_candlesticks()),
+                            .child(self.render_candlesticks(cx)),
                     )
                     .child(
                         // Tabbed Footer
@@ -1104,6 +1214,11 @@ impl Render for BarChart {
                             .rounded_lg()
                             .border_1()
                             .border_color(rgb(0x30363d))
+                            .on_mouse_move(cx.listener(|this, _event, _window, cx| {
+                                // Hide crosshair when mouse is over footer
+                                this.show_crosshair = false;
+                                cx.notify();
+                            }))
                             .child(
                                 // Tab buttons and refresh button
                                 div()
