@@ -8,7 +8,10 @@ use gpui::{
     WindowOptions, actions, div, prelude::*, px, rgb,
 };
 
+mod chart;
 mod stream;
+
+use chart::Chart;
 use stream::{StreamManager, StreamUpdate};
 use tokio::sync::mpsc;
 
@@ -44,14 +47,9 @@ enum FooterTab {
     Orders,
 }
 
-struct BarChart {
-    symbol: String,
-    symbol_input: String,
-    timeframe: String,
-    bars: Vec<Bar>,
-    loading: bool,
-    error: Option<String>,
-    input_focused: bool,
+struct TradingTerminal {
+    // Chart state
+    chart: Chart,
     focus_handle: FocusHandle,
     // Account information
     account_number: Option<String>,
@@ -82,32 +80,12 @@ struct BarChart {
     // WebSocket stream
     stream_connected: bool,
     stream_status: String,
-    // Market data stream
-    market_data_connected: bool,
-    last_bar_time: Option<String>,
-    // Crosshair tracking
-    mouse_position: Option<gpui::Point<gpui::Pixels>>,
-    show_crosshair: bool,
-    chart_bounds: Option<(f32, f32)>, // (width, height) in pixels
-    // Bar limit
-    bar_limit: String,
-    bar_limit_focused: bool,
-    // Chart scroll offset
-    chart_scroll_offset: f32,
-    // Bars per screen (for zoom control)
-    bars_per_screen: usize,
 }
 
-impl BarChart {
+impl TradingTerminal {
     fn new(cx: &mut Context<Self>) -> Self {
-        let mut chart = Self {
-            symbol: "AAPL".to_string(),
-            symbol_input: "AAPL".to_string(),
-            timeframe: "1Day".to_string(),
-            bars: Vec::new(),
-            loading: true,
-            error: None,
-            input_focused: false,
+        let mut terminal = Self {
+            chart: Chart::new("AAPL".to_string(), "1Day".to_string()),
             focus_handle: cx.focus_handle(),
             account_number: None,
             account_status: None,
@@ -132,47 +110,40 @@ impl BarChart {
             price_focused: false,
             stream_connected: false,
             stream_status: "Disconnected".to_string(),
-            market_data_connected: false,
-            last_bar_time: None,
-            mouse_position: None,
-            show_crosshair: false,
-            chart_bounds: None,
-            bar_limit: "100".to_string(),
-            bar_limit_focused: false,
-            chart_scroll_offset: 0.0,
-            bars_per_screen: 100,
         };
 
         // Fetch data on startup
-        chart.fetch_bars(cx);
-        chart.fetch_account(cx);
-        chart.fetch_positions(cx);
-        chart.start_websocket_stream(cx);
-        chart.start_market_data_stream(cx);
-        chart.fetch_orders(cx);
-        chart
+        terminal.fetch_bars(cx);
+        terminal.fetch_account(cx);
+        terminal.fetch_positions(cx);
+        terminal.start_websocket_stream(cx);
+        terminal.start_market_data_stream(cx);
+        terminal.fetch_orders(cx);
+        terminal
     }
 
     fn handle_input(&mut self, text: &str, cx: &mut Context<Self>) {
-        if !self.input_focused {
+        if !self.chart.input_focused {
             return;
         }
-        self.symbol_input.push_str(text);
+
+        self.chart.symbol_input.push_str(text);
         cx.notify();
     }
 
     fn handle_backspace(&mut self, cx: &mut Context<Self>) {
-        if !self.input_focused {
+        if !self.chart.input_focused {
             return;
         }
-        self.symbol_input.pop();
+
+        self.chart.symbol_input.pop();
         cx.notify();
     }
 
     fn submit_symbol(&mut self, cx: &mut Context<Self>) {
-        if !self.symbol_input.is_empty() {
-            self.symbol = self.symbol_input.clone().to_uppercase();
-            self.input_focused = false;
+        if !self.chart.symbol_input.is_empty() {
+            self.chart.symbol = self.chart.symbol_input.clone().to_uppercase();
+            self.chart.input_focused = false;
             self.fetch_bars(cx);
         }
     }
@@ -359,7 +330,7 @@ impl BarChart {
         self.order_message = None;
         cx.notify();
 
-        let symbol = self.symbol.clone();
+        let symbol = self.chart.symbol.clone();
         let side = match self.order_side {
             OrderSide::Buy => OrderSide::Buy,
             OrderSide::Sell => OrderSide::Sell,
@@ -457,12 +428,12 @@ impl BarChart {
             }
             StreamUpdate::MarketDataConnected => {
                 println!("✅ Market Data WebSocket connected!");
-                self.market_data_connected = true;
+                self.chart.market_data_connected = true;
                 cx.notify();
             }
             StreamUpdate::MarketDataDisconnected => {
                 println!("❌ Market Data WebSocket disconnected");
-                self.market_data_connected = false;
+                self.chart.market_data_connected = false;
                 cx.notify();
             }
             StreamUpdate::BarUpdate(bar_update) => {
@@ -554,7 +525,7 @@ impl BarChart {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<stream::StreamUpdate>();
 
         // Get the current symbol to subscribe to
-        let symbol = self.symbol.clone();
+        let symbol = self.chart.symbol.clone();
 
         // Start the market data WebSocket stream in a background task
         stream::MarketDataStreamManager::start_stream(sender, vec![symbol]);
@@ -571,47 +542,130 @@ impl BarChart {
     }
 
     fn update_bars_from_stream(&mut self, bar_update: stream::BarUpdate, cx: &mut Context<Self>) {
-        // Only update if the bar is for the current symbol
-        if bar_update.symbol != self.symbol {
-            return;
-        }
-
-        // Parse the bar data and convert to Bar struct
-        // Note: We need to convert from the stream BarUpdate to alpaca_markets::Bar
-        // For now, we'll just update the last_bar_time to show we're receiving data
-        self.last_bar_time = Some(bar_update.timestamp.clone());
+        // Store the bar update information for display
+        self.chart.last_bar_time = Some(bar_update.timestamp.clone());
+        self.chart.last_bar_symbol = Some(bar_update.symbol.clone());
+        self.chart.last_bar_open = Some(bar_update.open.clone());
+        self.chart.last_bar_high = Some(bar_update.high.clone());
+        self.chart.last_bar_low = Some(bar_update.low.clone());
+        self.chart.last_bar_close = Some(bar_update.close.clone());
+        self.chart.last_bar_volume = Some(bar_update.volume.clone());
 
         println!(
-            "✓ Bar updated for {} - O:{} H:{} L:{} C:{} V:{} @ {}",
+            "📊 Bar Update: {} @ {} - O:{} H:{} L:{} C:{} V:{}",
             bar_update.symbol,
+            bar_update.timestamp,
             bar_update.open,
             bar_update.high,
             bar_update.low,
             bar_update.close,
             bar_update.volume,
-            bar_update.timestamp
         );
 
-        // Optionally: Add the new bar to the bars list
-        // This would require converting BarUpdate to Bar, which depends on
-        // the Bar struct definition in alpaca_markets
-        // For real-time updates, you might want to:
-        // 1. Append the bar to self.bars if it's a new bar
-        // 2. Update the last bar if it's an update to the current bar
-        // 3. Trigger a chart refresh
+        // Only update chart if the bar is for the current symbol
+        if bar_update.symbol == self.chart.symbol {
+            // Convert BarUpdate to Bar struct
+            match chart::convert_bar_update_to_bar(&bar_update) {
+                Ok(new_bar) => {
+                    if self.chart.bars.is_empty() {
+                        // No existing bars, just add the new one
+                        self.chart.bars.push(new_bar);
+                        println!("✅ Added first bar to chart");
+                    } else {
+                        // Align the incoming bar timestamp to the chart's timeframe
+                        let aligned_timestamp = chart::align_timestamp_to_timeframe(
+                            new_bar.timestamp,
+                            &self.chart.timeframe,
+                        );
 
-        // For now, just notify to update the UI
+                        // Get the last bar's timestamp before taking mutable reference
+                        let last_bar_timestamp = self.chart.bars.last().unwrap().timestamp;
+                        let last_bar_aligned = chart::align_timestamp_to_timeframe(
+                            last_bar_timestamp,
+                            &self.chart.timeframe,
+                        );
+
+                        if aligned_timestamp == last_bar_aligned {
+                            // Get mutable reference after calculating timestamps
+                            let last_bar = self.chart.bars.last_mut().unwrap();
+                            // This bar update belongs to the same timeframe candle as the last bar
+                            // Update the last bar by aggregating the data
+                            println!(
+                                "🔄 Updating existing {} candle (period: {})",
+                                self.chart.timeframe,
+                                aligned_timestamp.format("%Y-%m-%d %H:%M:%S")
+                            );
+
+                            // Keep the open from the existing bar (first price of the period)
+                            // Update high to be the maximum
+                            last_bar.high = last_bar.high.max(new_bar.high);
+                            // Update low to be the minimum
+                            last_bar.low = last_bar.low.min(new_bar.low);
+                            // Update close to the latest close
+                            last_bar.close = new_bar.close;
+                            // Add the volume
+                            last_bar.volume += new_bar.volume;
+                            // Update timestamp to the latest
+                            last_bar.timestamp = new_bar.timestamp;
+                            // Update optional fields
+                            if let (Some(existing_tc), Some(new_tc)) =
+                                (last_bar.trade_count, new_bar.trade_count)
+                            {
+                                last_bar.trade_count = Some(existing_tc + new_tc);
+                            }
+
+                            println!(
+                                "✅ Updated current {} bar: O:{:.2} H:{:.2} L:{:.2} C:{:.2} V:{}",
+                                self.chart.timeframe,
+                                last_bar.open,
+                                last_bar.high,
+                                last_bar.low,
+                                last_bar.close,
+                                last_bar.volume
+                            );
+                        } else if aligned_timestamp > last_bar_aligned {
+                            // Get mutable reference is not needed here, just push
+                            // This is a new timeframe period - append a new bar
+                            println!(
+                                "➕ New {} candle period started: {}",
+                                self.chart.timeframe,
+                                aligned_timestamp.format("%Y-%m-%d %H:%M:%S")
+                            );
+                            self.chart.bars.push(new_bar);
+                            println!(
+                                "✅ Added new {} bar to chart (total: {})",
+                                self.chart.timeframe,
+                                self.chart.bars.len()
+                            );
+
+                            // Auto-scroll to show the latest bar
+                            if self.chart.bars.len() > self.chart.bars_per_screen {
+                                self.chart.chart_scroll_offset =
+                                    (self.chart.bars.len() - self.chart.bars_per_screen) as f32;
+                            }
+                        } else {
+                            println!("⚠️ Received bar with older timeframe period, ignoring");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Failed to convert bar update: {}", e);
+                }
+            }
+        }
+
+        // Notify to update the UI
         cx.notify();
     }
 
     fn fetch_bars(&mut self, cx: &mut Context<Self>) {
-        self.loading = true;
-        self.error = None;
+        self.chart.loading = true;
+        self.chart.error = None;
         cx.notify();
 
-        let symbol = self.symbol.clone();
-        let timeframe = self.timeframe.clone();
-        let limit = self.bar_limit.parse::<u32>().unwrap_or(100);
+        let symbol = self.chart.symbol.clone();
+        let timeframe = self.chart.timeframe.clone();
+        let limit = self.chart.bar_limit.parse::<u32>().unwrap_or(100);
 
         // Modern GPUI async pattern with AsyncApp::update()
         cx.spawn(async move |this, cx| {
@@ -622,24 +676,28 @@ impl BarChart {
                 .await;
 
             // Update UI using AsyncApp::update()
-            let _ = this.update(cx, |chart, cx| {
+            let _ = this.update(cx, |terminal, cx| {
                 match result {
                     Ok(bars) => {
-                        chart.bars = bars;
-                        chart.error = None;
+                        terminal.chart.bars = bars;
+                        terminal.chart.error = None;
                         // Set scroll offset to show most recent bars by default
-                        chart.chart_scroll_offset =
-                            chart.bars.len().saturating_sub(chart.bars_per_screen) as f32;
+                        terminal.chart.chart_scroll_offset = terminal
+                            .chart
+                            .bars
+                            .len()
+                            .saturating_sub(terminal.chart.bars_per_screen)
+                            as f32;
                         println!(
                             "✓ Successfully loaded {} bars for {} ({})",
-                            chart.bars.len(),
-                            chart.symbol,
-                            chart.timeframe
+                            terminal.chart.bars.len(),
+                            terminal.chart.symbol,
+                            terminal.chart.timeframe
                         );
                         // Debug: Show first and last bar prices with timestamps
-                        if !chart.bars.is_empty() {
-                            let first = &chart.bars[0];
-                            let last = &chart.bars[chart.bars.len() - 1];
+                        if !terminal.chart.bars.is_empty() {
+                            let first = &terminal.chart.bars[0];
+                            let last = &terminal.chart.bars[terminal.chart.bars.len() - 1];
                             println!(
                                 "  First bar: O:{:.2} H:{:.2} L:{:.2} C:{:.2} ({})",
                                 first.open,
@@ -659,116 +717,23 @@ impl BarChart {
                         }
                     }
                     Err(error) => {
-                        chart.error = Some(error.clone());
-                        chart.bars = generate_mock_data();
+                        terminal.chart.error = Some(error.clone());
+                        terminal.chart.bars = generate_mock_data();
                         eprintln!("✗ Error fetching bars: {}. Using mock data.", error);
                     }
                 }
-                chart.loading = false;
+                terminal.chart.loading = false;
                 cx.notify();
             });
         })
         .detach();
     }
 
-    // Helper function to calculate nice round grid values
-    fn calculate_round_grid_values(min: f64, max: f64, target_count: usize) -> Vec<f64> {
-        let range = max - min;
-        if range <= 0.0 {
-            return vec![min];
-        }
-
-        // Try different step sizes to find one that gives us close to target_count
-        let rough_step = range / target_count as f64;
-        let magnitude = 10_f64.powf(rough_step.log10().floor());
-
-        // Enforce minimum step size to prevent bunching - at least 1/20th of the range
-        let min_step = range / 20.0;
-
-        // Try multiple step size candidates in order of preference
-        // Include more intermediate values to prevent jumping (e.g., 20 -> 50)
-        let candidates = vec![
-            magnitude * 1.0,
-            magnitude * 2.0,
-            magnitude * 2.5,
-            magnitude * 4.0,
-            magnitude * 5.0,
-            magnitude * 10.0,
-            magnitude * 0.5,
-        ];
-
-        // Filter out steps that are too small
-        let candidates: Vec<f64> = candidates
-            .into_iter()
-            .filter(|&step| step >= min_step)
-            .collect();
-
-        // If all candidates are too small, just use the minimum step
-        let candidates = if candidates.is_empty() {
-            vec![min_step]
-        } else {
-            candidates
-        };
-
-        let mut best_values = Vec::new();
-        let mut best_diff = usize::MAX;
-
-        for &step in &candidates {
-            let start = (min / step).floor() * step;
-            let mut values = Vec::new();
-            let mut current = start;
-
-            while current <= max + step * 0.5 {
-                if current >= min - step * 0.1 {
-                    values.push(current);
-                }
-                current += step;
-                if values.len() > target_count * 2 {
-                    break;
-                }
-            }
-
-            // Filter to only include values within the actual range
-            values.retain(|&v| v >= min && v <= max);
-
-            // Check how close we are to the target count
-            let diff = if values.len() >= target_count {
-                values.len() - target_count
-            } else {
-                (target_count - values.len()) * 3 // Heavily penalize having too few lines
-            };
-
-            // Prefer this step if it's closer to target and has enough values
-            // Strongly prefer smaller steps (earlier in candidates list) when close to target
-            let is_better = if values.len() >= target_count.saturating_sub(1) {
-                // If we have enough lines, prefer smaller step even if diff is slightly worse
-                diff <= best_diff || best_values.len() < target_count
-            } else {
-                diff < best_diff
-            };
-
-            if values.len() >= target_count / 2 && is_better {
-                best_diff = diff;
-                best_values = values;
-            }
-        }
-
-        // Ensure we have at least 2 values
-        if best_values.is_empty() {
-            best_values.push(min);
-            best_values.push(max);
-        } else if best_values.len() == 1 {
-            best_values.push(best_values[0] + rough_step);
-        }
-
-        best_values
-    }
-
     fn render_candlesticks(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.bars.is_empty() {
-            let message = if self.loading {
+        if self.chart.bars.is_empty() {
+            let message = if self.chart.loading {
                 "Loading data from Alpaca Markets...".to_string()
-            } else if let Some(ref error) = self.error {
+            } else if let Some(ref error) = self.chart.error {
                 error.clone()
             } else {
                 "No data available.".to_string()
@@ -783,18 +748,18 @@ impl BarChart {
         }
 
         // Calculate visible range of bars (windowing for scrolling)
-        let bars_per_screen = self.bars_per_screen;
+        let bars_per_screen = self.chart.bars_per_screen;
         // Clamp start_index to valid range
         let start_index =
-            (self.chart_scroll_offset as usize).min(self.bars.len().saturating_sub(1));
-        let end_index = (start_index + bars_per_screen).min(self.bars.len());
+            (self.chart.chart_scroll_offset as usize).min(self.chart.bars.len().saturating_sub(1));
+        let end_index = (start_index + bars_per_screen).min(self.chart.bars.len());
         // Ensure we don't have an empty range
         let start_index = if end_index > start_index {
             start_index
         } else {
             0
         };
-        let visible_bars = &self.bars[start_index..end_index];
+        let visible_bars = &self.chart.bars[start_index..end_index];
 
         // Calculate price range for visible bars only
         let max_price = visible_bars
@@ -856,7 +821,7 @@ impl BarChart {
                                     let relative_x = event.position.x - offset_x;
                                     let relative_y = event.position.y - offset_y;
 
-                                    this.mouse_position = Some(gpui::Point {
+                                    this.chart.mouse_position = Some(gpui::Point {
                                         x: relative_x,
                                         y: relative_y,
                                     });
@@ -890,8 +855,8 @@ impl BarChart {
                                     println!("Window H: {:.0}px, Chart H: {:.0}px (= {:.0} - {:.0} - {:.0}), Mouse Y: {:.0}px",
                                              window_height, chart_height, window_height, offset_y_f32, bottom_offset, relative_y);
 
-                                    this.chart_bounds = Some((chart_width, chart_height));
-                                    this.show_crosshair = true;
+                                    this.chart.chart_bounds = Some((chart_width, chart_height));
+                                    this.chart.show_crosshair = true;
                                     cx.notify();
                                 },
                             ))
@@ -907,38 +872,38 @@ impl BarChart {
 
                                         if zoom_amount > 0 {
                                             // Zoom out (show more bars)
-                                            this.bars_per_screen = (this.bars_per_screen
+                                            this.chart.bars_per_screen = (this.chart.bars_per_screen
                                                 + zoom_amount as usize)
-                                                .min(this.bars.len());
+                                                .min(this.chart.bars.len());
                                         } else {
                                             // Zoom in (show fewer bars)
-                                            this.bars_per_screen =
-                                                (this.bars_per_screen as i32 + zoom_amount).max(10)
+                                            this.chart.bars_per_screen =
+                                                (this.chart.bars_per_screen as i32 + zoom_amount).max(10)
                                                     as usize;
                                         }
 
                                         // Adjust scroll offset to keep it in bounds
                                         let max_offset =
-                                            this.bars.len().saturating_sub(this.bars_per_screen)
+                                            this.chart.bars.len().saturating_sub(this.chart.bars_per_screen)
                                                 as f32;
-                                        this.chart_scroll_offset =
-                                            this.chart_scroll_offset.min(max_offset);
+                                        this.chart.chart_scroll_offset =
+                                            this.chart.chart_scroll_offset.min(max_offset);
                                     } else {
                                         // Normal scroll: move through bars
                                         let max_offset =
-                                            this.bars.len().saturating_sub(this.bars_per_screen)
+                                            this.chart.bars.len().saturating_sub(this.chart.bars_per_screen)
                                                 as f32;
                                         let scroll_amount = scroll_amount * 0.5; // Adjust sensitivity
 
                                         if scroll_amount > 0.0 {
                                             // Scroll forward (show older bars)
-                                            this.chart_scroll_offset = (this.chart_scroll_offset
+                                            this.chart.chart_scroll_offset = (this.chart.chart_scroll_offset
                                                 + scroll_amount)
                                                 .min(max_offset);
                                         } else {
                                             // Scroll backward (show newer bars)
-                                            this.chart_scroll_offset =
-                                                (this.chart_scroll_offset + scroll_amount).max(0.0);
+                                            this.chart.chart_scroll_offset =
+                                                (this.chart.chart_scroll_offset + scroll_amount).max(0.0);
                                         }
                                     }
 
@@ -948,21 +913,21 @@ impl BarChart {
                             // Price grid lines with round values (adaptive to zoom level)
                             .children({
                                 // Adjust grid line count based on zoom level
-                                let grid_count = if self.bars_per_screen <= 20 {
+                                let grid_count = if self.chart.bars_per_screen <= 20 {
                                     12 // Very zoomed in - show many grid lines
-                                } else if self.bars_per_screen <= 50 {
+                                } else if self.chart.bars_per_screen <= 50 {
                                     10 // Moderately zoomed in
-                                } else if self.bars_per_screen <= 100 {
+                                } else if self.chart.bars_per_screen <= 100 {
                                     8 // Default zoom
-                                } else if self.bars_per_screen <= 200 {
+                                } else if self.chart.bars_per_screen <= 200 {
                                     6 // Zoomed out
-                                } else if self.bars_per_screen <= 500 {
+                                } else if self.chart.bars_per_screen <= 500 {
                                     5 // More zoomed out
                                 } else {
                                     4 // Very zoomed out - show fewer grid lines
                                 };
 
-                                let grid_values = Self::calculate_round_grid_values(
+                                let grid_values = chart::calculate_round_grid_values(
                                     adjusted_min,
                                     adjusted_max,
                                     grid_count,
@@ -1013,6 +978,11 @@ impl BarChart {
 
                                 // Determine if bullish or bearish
                                 let is_bullish = bar.close >= bar.open;
+
+                                // Check if this is the most recent bar (live updating)
+                                let is_latest_bar = i == visible_bars.len() - 1 &&
+                                    end_index == self.chart.bars.len();
+
                                 let color = if is_bullish {
                                     rgb(0x00cc66)
                                 } else {
@@ -1026,7 +996,7 @@ impl BarChart {
                                         (x_percent + bar_width_percent / 2.0) / 100.0,
                                     ))
                                     .top(gpui::relative(high_y_percent / 100.0))
-                                    .w(px(1.0))
+                                    .w(if is_latest_bar { px(2.0) } else { px(1.0) })
                                     .h(gpui::relative(wick_height_percent / 100.0))
                                     .bg(color)
                             }))
@@ -1055,6 +1025,11 @@ impl BarChart {
 
                                 // Determine if bullish or bearish
                                 let is_bullish = bar.close >= bar.open;
+
+                                // Check if this is the most recent bar (live updating)
+                                let is_latest_bar = i == visible_bars.len() - 1 &&
+                                    end_index == self.chart.bars.len();
+
                                 let (color, fill_color) = if is_bullish {
                                     (rgb(0x00cc66), rgb(0x00cc66))
                                 } else {
@@ -1062,25 +1037,37 @@ impl BarChart {
                                 };
 
                                 // Open-Close body (thicker rectangle)
-                                div()
+                                let mut body_div = div()
                                     .absolute()
                                     .left(gpui::relative(x_percent / 100.0))
                                     .top(gpui::relative(body_top_percent / 100.0))
                                     .w(gpui::relative(bar_width_percent / 100.0))
                                     .h(gpui::relative(body_height_percent / 100.0))
-                                    .bg(fill_color)
-                                    .border_1()
-                                    .border_color(color)
+                                    .bg(fill_color);
+
+                                // Add thicker border and glow effect for the latest bar
+                                if is_latest_bar {
+                                    body_div = body_div
+                                        .border_2()
+                                        .border_color(color)
+                                        .shadow_lg();
+                                } else {
+                                    body_div = body_div
+                                        .border_1()
+                                        .border_color(color);
+                                }
+
+                                body_div
                             }))
                             // Crosshair overlay
-                            .children(if self.show_crosshair && self.mouse_position.is_some() {
-                                let mouse_pos = self.mouse_position.unwrap();
+                            .children(if self.chart.show_crosshair && self.chart.mouse_position.is_some() {
+                                let mouse_pos = self.chart.mouse_position.unwrap();
 
                                 // Calculate price from mouse Y position
                                 // Grid lines use full height (0-100%) without padding
                                 let mouse_y_f32: f32 = mouse_pos.y.into();
                                 let chart_height =
-                                    self.chart_bounds.map(|(_, h)| h).unwrap_or(400.0);
+                                    self.chart.chart_bounds.map(|(_, h)| h).unwrap_or(400.0);
 
                                 // Account for 2px border on chart container
                                 let border_offset = 2.0;
@@ -1105,7 +1092,7 @@ impl BarChart {
                                 // Calculate bar index from mouse X position
                                 let mouse_x_f32: f32 = mouse_pos.x.into();
                                 let chart_width =
-                                    self.chart_bounds.map(|(w, _)| w).unwrap_or(800.0);
+                                    self.chart.chart_bounds.map(|(w, _)| w).unwrap_or(800.0);
                                 let x_percent = (mouse_x_f32 / chart_width) * 100.0;
 
                                 let padding_left_percent = 5.0;
@@ -1204,7 +1191,7 @@ impl BarChart {
                     .p_2()
                     .on_mouse_move(cx.listener(|this, _event, _window, cx| {
                         // Hide crosshair when mouse is over scroll controls
-                        this.show_crosshair = false;
+                        this.chart.show_crosshair = false;
                         cx.notify();
                     }))
                     .child(
@@ -1220,22 +1207,44 @@ impl BarChart {
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
                                 cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
-                                    if this.chart_scroll_offset > 0.0 {
-                                        this.chart_scroll_offset =
-                                            (this.chart_scroll_offset - 50.0).max(0.0);
+                                    if this.chart.chart_scroll_offset > 0.0 {
+                                        this.chart.chart_scroll_offset =
+                                            (this.chart.chart_scroll_offset - 50.0).max(0.0);
                                         cx.notify();
                                     }
                                 }),
                             )
                             .child("← Previous 50"),
                     )
-                    .child(div().text_sm().text_color(rgb(0x808080)).child(format!(
-                        "Showing bars {}-{} of {} | Zoom: {} bars",
-                        start_index + 1,
-                        end_index,
-                        self.bars.len(),
-                        self.bars_per_screen
-                    )))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_center()
+                            .text_sm()
+                            .text_color(rgb(0x808080))
+                            .child(format!(
+                                "Showing bars {}-{} of {} | Zoom: {} bars",
+                                start_index + 1,
+                                end_index,
+                                self.chart.bars.len(),
+                                self.chart.bars_per_screen
+                            ))
+                            .when(end_index == self.chart.bars.len() && self.chart.market_data_connected, |this| {
+                                this.child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .bg(rgb(0x238636))
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(rgb(0xffffff))
+                                        .child("● LIVE")
+                                )
+                            })
+                    )
                     .child(
                         div()
                             .px_3()
@@ -1250,10 +1259,10 @@ impl BarChart {
                                 gpui::MouseButton::Left,
                                 cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
                                     let max_offset =
-                                        this.bars.len().saturating_sub(this.bars_per_screen) as f32;
-                                    if this.chart_scroll_offset < max_offset {
-                                        this.chart_scroll_offset =
-                                            (this.chart_scroll_offset + 50.0).min(max_offset);
+                                        this.chart.bars.len().saturating_sub(this.chart.bars_per_screen) as f32;
+                                    if this.chart.chart_scroll_offset < max_offset {
+                                        this.chart.chart_scroll_offset =
+                                            (this.chart.chart_scroll_offset + 50.0).min(max_offset);
                                         cx.notify();
                                     }
                                 }),
@@ -1274,8 +1283,8 @@ impl BarChart {
                                 gpui::MouseButton::Left,
                                 cx.listener(|this, _event: &gpui::MouseDownEvent, _window, cx| {
                                     // Show most recent bars
-                                    this.chart_scroll_offset =
-                                        this.bars.len().saturating_sub(this.bars_per_screen) as f32;
+                                    this.chart.chart_scroll_offset =
+                                        this.chart.bars.len().saturating_sub(this.chart.bars_per_screen) as f32;
                                     cx.notify();
                                 }),
                             )
@@ -1292,8 +1301,8 @@ impl BarChart {
                     .child(div().child(format!("High: ${:.2}", max_price)))
                     .child(div().child(format!("Low: ${:.2}", min_price)))
                     .child(div().child(format!("Range: ${:.2}", price_range)))
-                    .child(div().child(format!("Bars: {}", self.bars.len())))
-                    .when_some(self.bars.last(), |this, last_bar| {
+                    .child(div().child(format!("Bars: {}", self.chart.bars.len())))
+                    .when_some(self.chart.bars.last(), |this, last_bar| {
                         let is_bullish = last_bar.close >= last_bar.open;
                         let color = if is_bullish {
                             rgb(0x00cc66)
@@ -1310,9 +1319,9 @@ impl BarChart {
     }
 }
 
-impl Render for BarChart {
+impl Render for TradingTerminal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let timeframe_display = match self.timeframe.as_str() {
+        let timeframe_display = match self.chart.timeframe.as_str() {
             "1Min" => "1 Minute",
             "5Min" => "5 Minutes",
             "15Min" => "15 Minutes",
@@ -1320,7 +1329,7 @@ impl Render for BarChart {
             "1Day" => "Daily",
             "1Week" => "Weekly",
             "1Month" => "Monthly",
-            _ => &self.timeframe,
+            _ => &self.chart.timeframe,
         };
 
         div()
@@ -1342,7 +1351,7 @@ impl Render for BarChart {
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                         // Handle symbol input
-                        if this.input_focused {
+                        if this.chart.input_focused {
                             let key = event.keystroke.key.as_str();
 
                             if key == "enter" {
@@ -1350,7 +1359,7 @@ impl Render for BarChart {
                             } else if key == "backspace" {
                                 this.handle_backspace(cx);
                             } else if key == "escape" {
-                                this.input_focused = false;
+                                this.chart.input_focused = false;
                                 cx.notify();
                             } else if let Some(key_char) = &event.keystroke.key_char {
                                 if key_char.len() == 1
@@ -1411,21 +1420,20 @@ impl Render for BarChart {
                         }
 
                         // Handle bar limit input
-                        if this.bar_limit_focused {
+                        if this.chart.bar_limit_focused {
                             let key = event.keystroke.key.as_str();
 
                             if key == "enter" {
-                                this.bar_limit_focused = false;
-                                cx.notify();
+                                this.fetch_bars(cx);
                             } else if key == "backspace" {
-                                this.bar_limit.pop();
+                                this.chart.bar_limit.pop();
                                 cx.notify();
                             } else if key == "escape" {
-                                this.bar_limit_focused = false;
+                                this.chart.bar_limit_focused = false;
                                 cx.notify();
                             } else if let Some(key_char) = &event.keystroke.key_char {
                                 if key_char.len() == 1 && key_char.chars().all(|c| c.is_numeric()) {
-                                    this.bar_limit.push_str(key_char);
+                                    this.chart.bar_limit.push_str(key_char);
                                     cx.notify();
                                 }
                             }
@@ -1441,7 +1449,7 @@ impl Render for BarChart {
                             .justify_between()
                             .on_mouse_move(cx.listener(|this, _event, _window, cx| {
                                 // Hide crosshair when mouse is over header
-                                this.show_crosshair = false;
+                                this.chart.show_crosshair = false;
                                 cx.notify();
                             }))
                             .child(
@@ -1472,13 +1480,13 @@ impl Render for BarChart {
                                                             .id("symbol-input")
                                                             .px_4()
                                                             .py_2()
-                                                            .bg(if self.input_focused {
+                                                            .bg(if self.chart.input_focused {
                                                                 rgb(0x1f2937)
                                                             } else {
                                                                 rgb(0x161b22)
                                                             })
                                                             .border_1()
-                                                            .border_color(if self.input_focused {
+                                                            .border_color(if self.chart.input_focused {
                                                                 rgb(0x1f6feb)
                                                             } else {
                                                                 rgb(0x30363d)
@@ -1487,16 +1495,16 @@ impl Render for BarChart {
                                                             .text_color(rgb(0xffffff))
                                                             .min_w(px(120.0))
                                                             .cursor_text()
-                                                            .child(if self.input_focused {
-                                                                format!("{}|", self.symbol_input)
-                                                            } else if self.symbol_input.is_empty() {
+                                                            .child(if self.chart.input_focused {
+                                                                format!("{}|", self.chart.symbol_input)
+                                                            } else if self.chart.symbol_input.is_empty() {
                                                                 "Enter symbol...".to_string()
                                                             } else {
-                                                                self.symbol_input.clone()
+                                                                self.chart.symbol_input.clone()
                                                             })
                                                             .on_click(cx.listener(
                                                                 |this, _, _window, cx| {
-                                                                    this.input_focused = true;
+                                                                    this.chart.input_focused = true;
                                                                     _window
                                                                         .focus(&this.focus_handle);
                                                                     cx.notify();
@@ -1591,13 +1599,13 @@ impl Render for BarChart {
                                                     .id("bar-limit-input")
                                                     .px_4()
                                                     .py_2()
-                                                    .bg(if self.bar_limit_focused {
+                                                    .bg(if self.chart.bar_limit_focused {
                                                         rgb(0x1f2937)
                                                     } else {
                                                         rgb(0x161b22)
                                                     })
                                                     .border_1()
-                                                    .border_color(if self.bar_limit_focused {
+                                                    .border_color(if self.chart.bar_limit_focused {
                                                         rgb(0x1f6feb)
                                                     } else {
                                                         rgb(0x30363d)
@@ -1606,17 +1614,17 @@ impl Render for BarChart {
                                                     .text_color(rgb(0xffffff))
                                                     .min_w(px(80.0))
                                                     .cursor_text()
-                                                    .child(if self.bar_limit_focused {
-                                                        format!("{}|", self.bar_limit)
-                                                    } else if self.bar_limit.is_empty() {
+                                                    .child(if self.chart.bar_limit_focused {
+                                                        format!("{}|", self.chart.bar_limit)
+                                                    } else if self.chart.bar_limit.is_empty() {
                                                         "100".to_string()
                                                     } else {
-                                                        self.bar_limit.clone()
+                                                        self.chart.bar_limit.clone()
                                                     })
                                                     .on_click(cx.listener(
                                                         |this, _, _window, cx| {
-                                                            this.bar_limit_focused = true;
-                                                            this.input_focused = false;
+                                                            this.chart.bar_limit_focused = true;
+                                                            this.chart.input_focused = false;
                                                             this.quantity_focused = false;
                                                             this.price_focused = false;
                                                             _window.focus(&this.focus_handle);
@@ -1637,7 +1645,7 @@ impl Render for BarChart {
                                             .text_2xl()
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(rgb(0xffffff))
-                                            .child(format!("{} Stock Chart", self.symbol)),
+                                            .child(format!("{} Stock Chart", self.chart.symbol)),
                                     )
                                     .child(div().text_sm().text_color(rgb(0x808080)).child(
                                         format!(
@@ -1685,28 +1693,63 @@ impl Render for BarChart {
                                             .px_4()
                                             .py_3()
                                             .rounded_lg()
-                                            .bg(if self.market_data_connected {
+                                            .bg(if self.chart.market_data_connected {
                                                 rgb(0x1f6feb)
                                             } else {
                                                 rgb(0x6e7681)
                                             })
                                             .child(
-                                                div().text_sm().text_color(rgb(0xffffff)).child(
-                                                    if self.market_data_connected {
-                                                        if let Some(ref last_time) =
-                                                            self.last_bar_time
-                                                        {
-                                                            format!(
-                                                                "📊 Market Data (Last: {})",
-                                                                &last_time[11..19]
-                                                            ) // Show just HH:MM:SS
-                                                        } else {
-                                                            "📊 Market Data".to_string()
-                                                        }
-                                                    } else {
-                                                        "📊 No Market Data".to_string()
-                                                    },
-                                                ),
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_1()
+                                                    .child(
+                                                        div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(rgb(0xffffff)).child(
+                                                            if self.chart.market_data_connected {
+                                                                "📊 Market Data Stream"
+                                                            } else {
+                                                                "📊 No Market Data"
+                                                            }
+                                                        )
+                                                    )
+                                                    .when(self.chart.market_data_connected && self.chart.last_bar_symbol.is_some(), |this| {
+                                                        this.child(
+                                                            div()
+                                                                .flex()
+                                                                .flex_col()
+                                                                .gap_1()
+                                                                .text_xs()
+                                                                .text_color(rgb(0xcccccc))
+                                                                .child(
+                                                                    div().child(format!(
+                                                                        "Symbol: {} | Time: {}",
+                                                                        self.chart.last_bar_symbol.as_ref().unwrap(),
+                                                                        self.chart.last_bar_time.as_ref().map(|t| {
+                                                                            if t.len() >= 19 {
+                                                                                &t[11..19] // HH:MM:SS
+                                                                            } else {
+                                                                                t.as_str()
+                                                                            }
+                                                                        }).unwrap_or("--:--:--")
+                                                                    ))
+                                                                )
+                                                                .child(
+                                                                    div().child(format!(
+                                                                        "O: {} | H: {} | L: {} | C: {}",
+                                                                        self.chart.last_bar_open.as_ref().unwrap_or(&"--".to_string()),
+                                                                        self.chart.last_bar_high.as_ref().unwrap_or(&"--".to_string()),
+                                                                        self.chart.last_bar_low.as_ref().unwrap_or(&"--".to_string()),
+                                                                        self.chart.last_bar_close.as_ref().unwrap_or(&"--".to_string()),
+                                                                    ))
+                                                                )
+                                                                .child(
+                                                                    div().child(format!(
+                                                                        "Volume: {}",
+                                                                        self.chart.last_bar_volume.as_ref().unwrap_or(&"--".to_string()),
+                                                                    ))
+                                                                )
+                                                        )
+                                                    }),
                                             ),
                                     ),
                             )
@@ -1722,7 +1765,7 @@ impl Render for BarChart {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .cursor_pointer()
                                     .hover(|style| style.bg(rgb(0x2ea043)))
-                                    .child(if self.loading {
+                                    .child(if self.chart.loading {
                                         "⟳ Loading..."
                                     } else {
                                         "↻ Refresh Data"
@@ -1736,7 +1779,7 @@ impl Render for BarChart {
                         // Spacer div between header and chart to catch mouse events in the gap
                         div().h(px(24.0)).w_full().on_mouse_move(cx.listener(
                             |this, _event, _window, cx| {
-                                this.show_crosshair = false;
+                                this.chart.show_crosshair = false;
                                 cx.notify();
                             },
                         )),
@@ -1752,7 +1795,7 @@ impl Render for BarChart {
                                 // Left padding area to catch mouse events
                                 div().w(px(32.0)).h_full().on_mouse_move(cx.listener(
                                     |this, _event, _window, cx| {
-                                        this.show_crosshair = false;
+                                        this.chart.show_crosshair = false;
                                         cx.notify();
                                     },
                                 )),
@@ -1770,7 +1813,7 @@ impl Render for BarChart {
                                 // Right padding area to catch mouse events
                                 div().w(px(32.0)).h_full().on_mouse_move(cx.listener(
                                     |this, _event, _window, cx| {
-                                        this.show_crosshair = false;
+                                        this.chart.show_crosshair = false;
                                         cx.notify();
                                     },
                                 )),
@@ -1780,7 +1823,7 @@ impl Render for BarChart {
                         // Spacer div between chart and footer to catch mouse events in the gap
                         div().h(px(24.0)).w_full().on_mouse_move(cx.listener(
                             |this, _event, _window, cx| {
-                                this.show_crosshair = false;
+                                this.chart.show_crosshair = false;
                                 cx.notify();
                             },
                         )),
@@ -1799,7 +1842,7 @@ impl Render for BarChart {
                             .border_color(rgb(0x30363d))
                             .on_mouse_move(cx.listener(|this, _event, _window, cx| {
                                 // Hide crosshair when mouse is over footer
-                                this.show_crosshair = false;
+                                this.chart.show_crosshair = false;
                                 cx.notify();
                             }))
                             .child(
@@ -1977,7 +2020,7 @@ impl Render for BarChart {
                     .gap_4()
                     .on_mouse_move(cx.listener(|this, _event, _window, cx| {
                         // Hide crosshair when mouse is over sidebar
-                        this.show_crosshair = false;
+                        this.chart.show_crosshair = false;
                         cx.notify();
                     }))
                     .child(
@@ -2010,7 +2053,7 @@ impl Render for BarChart {
                                     .rounded_md()
                                     .text_color(rgb(0x58a6ff))
                                     .font_weight(FontWeight::BOLD)
-                                    .child(self.symbol.clone()),
+                                    .child(self.chart.symbol.clone()),
                             ),
                     )
                     .child(
@@ -2208,7 +2251,7 @@ impl Render for BarChart {
                                     })
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.quantity_focused = true;
-                                        this.input_focused = false;
+                                        this.chart.input_focused = false;
                                         this.price_focused = false;
                                         _window.focus(&this.focus_handle);
                                         cx.notify();
@@ -2257,7 +2300,7 @@ impl Render for BarChart {
                                     } else {
                                         "Sell"
                                     },
-                                    self.symbol
+                                    self.chart.symbol
                                 )
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -2271,7 +2314,7 @@ impl Render for BarChart {
     }
 }
 
-impl BarChart {
+impl TradingTerminal {
     fn render_account_tab(&self) -> impl IntoElement {
         div()
             .flex()
@@ -2741,7 +2784,7 @@ impl BarChart {
                     })
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.price_focused = true;
-                        this.input_focused = false;
+                        this.chart.input_focused = false;
                         this.quantity_focused = false;
                         _window.focus(&this.focus_handle);
                         cx.notify();
@@ -2886,7 +2929,7 @@ impl BarChart {
         label: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_selected = self.timeframe == timeframe;
+        let is_selected = self.chart.timeframe == timeframe;
         let timeframe_owned = timeframe.to_string();
         let label_owned = label.to_string();
         let element_id = format!("timeframe-{}", timeframe);
@@ -2927,7 +2970,7 @@ impl BarChart {
             })
             .child(label_owned)
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.timeframe = timeframe_owned.clone();
+                this.chart.timeframe = timeframe_owned.clone();
                 this.fetch_bars(cx);
             }))
     }
@@ -3259,7 +3302,9 @@ fn main() {
         cx.activate(true);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
-        cx.open_window(WindowOptions::default(), |_, cx| cx.new(BarChart::new))
-            .unwrap();
+        cx.open_window(WindowOptions::default(), |_, cx| {
+            cx.new(TradingTerminal::new)
+        })
+        .unwrap();
     });
 }
