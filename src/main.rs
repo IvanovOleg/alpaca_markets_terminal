@@ -1,5 +1,5 @@
 use alpaca_markets::{
-    Adjustment, AlpacaConfig, Bar, MarketDataClient, Sort, TradingClient,
+    Adjustment, AlpacaConfig, Bar, MarketDataClient, Sort,
     models::{OrderSide, OrderTimeInForce, OrderType},
 };
 use chrono::{Duration, Utc};
@@ -8,75 +8,23 @@ use gpui::{
     WindowOptions, actions, div, prelude::*, px, rgb,
 };
 
+mod account;
 mod chart;
 mod stream;
 
+use account::Account;
 use chart::Chart;
 use stream::{StreamManager, StreamUpdate};
 use tokio::sync::mpsc;
 
 actions!(app, [Quit, RefreshData]);
 
-#[derive(Clone)]
-struct Position {
-    symbol: String,
-    qty: String,
-    avg_entry_price: String,
-    current_price: String,
-    market_value: String,
-    unrealized_pl: String,
-    unrealized_plpc: String,
-}
-
-#[derive(Clone)]
-struct Order {
-    id: String,
-    symbol: String,
-    side: String,
-    qty: String,
-    order_type: String,
-    limit_price: Option<String>,
-    status: String,
-    created_at: String,
-}
-
-#[derive(Clone, PartialEq)]
-enum FooterTab {
-    Account,
-    Positions,
-    Orders,
-}
-
 struct TradingTerminal {
     // Chart state
     chart: Chart,
     focus_handle: FocusHandle,
-    // Account information
-    account_number: Option<String>,
-    account_status: Option<String>,
-    buying_power: Option<f64>,
-    cash: Option<f64>,
-    portfolio_value: Option<f64>,
-    equity: Option<f64>,
-    account_loading: bool,
-    // Positions information
-    positions: Vec<Position>,
-    positions_loading: bool,
-    // Orders information
-    orders: Vec<Order>,
-    orders_loading: bool,
-    active_footer_tab: FooterTab,
-    // Order form fields
-    order_side: OrderSide,
-    order_type: OrderType,
-    order_quantity: String,
-    order_limit_price: String,
-    order_time_in_force: OrderTimeInForce,
-    order_submitting: bool,
-    order_message: Option<String>,
-    // Input focus tracking
-    quantity_focused: bool,
-    price_focused: bool,
+    // Account state
+    account: Account,
     // WebSocket stream
     stream_connected: bool,
     stream_status: String,
@@ -87,27 +35,8 @@ impl TradingTerminal {
         let mut terminal = Self {
             chart: Chart::new("AAPL".to_string(), "1Day".to_string()),
             focus_handle: cx.focus_handle(),
-            account_number: None,
-            account_status: None,
-            buying_power: None,
-            cash: None,
-            portfolio_value: None,
-            equity: None,
-            account_loading: true,
-            positions: Vec::new(),
-            positions_loading: true,
-            orders: Vec::new(),
-            orders_loading: true,
-            active_footer_tab: FooterTab::Account,
-            order_side: OrderSide::Buy,
-            order_type: OrderType::Market,
-            order_quantity: "".to_string(),
-            order_limit_price: "".to_string(),
-            order_time_in_force: OrderTimeInForce::Day,
-            order_submitting: false,
-            order_message: None,
-            quantity_focused: false,
-            price_focused: false,
+            account: Account::new(),
+
             stream_connected: false,
             stream_status: "Disconnected".to_string(),
         };
@@ -149,32 +78,32 @@ impl TradingTerminal {
     }
 
     fn fetch_account(&mut self, cx: &mut Context<Self>) {
-        self.account_loading = true;
+        self.account.account_loading = true;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { fetch_account_sync() })
+                .spawn(async move { account::fetch_account_sync() })
                 .await;
 
-            let _ = this.update(cx, |chart, cx| {
+            let _ = this.update(cx, |terminal, cx| {
                 match result {
                     Ok(account_data) => {
-                        chart.account_number = Some(account_data.0);
-                        chart.account_status = Some(account_data.1);
-                        chart.buying_power = Some(account_data.2);
-                        chart.cash = Some(account_data.3);
-                        chart.portfolio_value = Some(account_data.4);
-                        chart.equity = Some(account_data.5);
+                        terminal.account.account_number = Some(account_data.0);
+                        terminal.account.account_status = Some(account_data.1);
+                        terminal.account.buying_power = Some(account_data.2);
+                        terminal.account.cash = Some(account_data.3);
+                        terminal.account.portfolio_value = Some(account_data.4);
+                        terminal.account.equity = Some(account_data.5);
                         println!("✓ Successfully loaded account information");
                     }
                     Err(error) => {
                         eprintln!("✗ Error fetching account: {}", error);
-                        chart.account_status = Some("Error".to_string());
+                        terminal.account.account_status = Some("Error".to_string());
                     }
                 }
-                chart.account_loading = false;
+                terminal.account.account_loading = false;
                 cx.notify();
             });
         })
@@ -182,27 +111,30 @@ impl TradingTerminal {
     }
 
     fn fetch_positions(&mut self, cx: &mut Context<Self>) {
-        self.positions_loading = true;
+        self.account.positions_loading = true;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { fetch_positions_sync() })
+                .spawn(async move { account::fetch_positions_sync() })
                 .await;
 
-            let _ = this.update(cx, |chart, cx| {
+            let _ = this.update(cx, |terminal, cx| {
                 match result {
                     Ok(positions) => {
-                        chart.positions = positions;
-                        println!("✓ Successfully loaded {} positions", chart.positions.len());
+                        terminal.account.positions = positions;
+                        println!(
+                            "✓ Successfully loaded {} positions",
+                            terminal.account.positions.len()
+                        );
                     }
                     Err(error) => {
                         eprintln!("✗ Error fetching positions: {}", error);
-                        chart.positions.clear();
+                        terminal.account.positions.clear();
                     }
                 }
-                chart.positions_loading = false;
+                terminal.account.positions_loading = false;
                 cx.notify();
             });
         })
@@ -210,16 +142,16 @@ impl TradingTerminal {
     }
 
     fn fetch_orders(&mut self, cx: &mut Context<Self>) {
-        self.orders_loading = true;
+        self.account.orders_loading = true;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { fetch_orders_sync() })
+                .spawn(async move { account::fetch_orders_sync() })
                 .await;
 
-            let _ = this.update(cx, |chart, cx| {
+            let _ = this.update(cx, |terminal, cx| {
                 match result {
                     Ok(mut orders) => {
                         // Filter out terminal state orders (filled, canceled, expired, rejected)
@@ -229,15 +161,18 @@ impl TradingTerminal {
                                 "filled" | "canceled" | "expired" | "rejected"
                             )
                         });
-                        chart.orders = orders;
-                        println!("✓ Successfully loaded {} active orders", chart.orders.len());
+                        terminal.account.orders = orders;
+                        println!(
+                            "✓ Successfully loaded {} active orders",
+                            terminal.account.orders.len()
+                        );
                     }
                     Err(error) => {
                         eprintln!("✗ Error fetching orders: {}", error);
-                        chart.orders.clear();
+                        terminal.account.orders.clear();
                     }
                 }
-                chart.orders_loading = false;
+                terminal.account.orders_loading = false;
                 cx.notify();
             });
         })
@@ -248,10 +183,10 @@ impl TradingTerminal {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { cancel_order_sync(order_id) })
+                .spawn(async move { account::cancel_order_sync(order_id) })
                 .await;
 
-            let _ = this.update(cx, |_chart, cx| {
+            let _ = this.update(cx, |_terminal, cx| {
                 match result {
                     Ok(_) => {
                         println!("✓ Order canceled successfully");
@@ -271,15 +206,15 @@ impl TradingTerminal {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { close_position_sync(symbol) })
+                .spawn(async move { account::close_position_sync(symbol) })
                 .await;
 
-            let _ = this.update(cx, |chart, cx| {
+            let _ = this.update(cx, |terminal, cx| {
                 match result {
                     Ok(_) => {
                         println!("✓ Position closed successfully");
                         // Refresh positions list (WebSocket handles order updates)
-                        chart.fetch_positions(cx);
+                        terminal.fetch_positions(cx);
                     }
                     Err(error) => {
                         eprintln!("✗ Error closing position: {}", error);
@@ -292,32 +227,35 @@ impl TradingTerminal {
 
     fn submit_order(&mut self, cx: &mut Context<Self>) {
         // Validate inputs
-        if self.order_quantity.trim().is_empty() {
-            self.order_message = Some("Error: Quantity cannot be empty".to_string());
+        if self.account.order_quantity.trim().is_empty() {
+            self.account.order_message = Some("Error: Quantity cannot be empty".to_string());
             cx.notify();
             return;
         }
 
-        let qty = match self.order_quantity.parse::<f64>() {
+        let qty = match self.account.order_quantity.parse::<f64>() {
             Ok(q) if q > 0.0 => q,
             _ => {
-                self.order_message = Some("Error: Invalid quantity".to_string());
+                self.account.order_message = Some("Error: Invalid quantity".to_string());
                 cx.notify();
                 return;
             }
         };
 
-        if matches!(self.order_type, OrderType::Limit) && self.order_limit_price.trim().is_empty() {
-            self.order_message = Some("Error: Limit price required for limit orders".to_string());
+        if matches!(self.account.order_type, OrderType::Limit)
+            && self.account.order_limit_price.trim().is_empty()
+        {
+            self.account.order_message =
+                Some("Error: Limit price required for limit orders".to_string());
             cx.notify();
             return;
         }
 
-        let limit_price = if matches!(self.order_type, OrderType::Limit) {
-            match self.order_limit_price.parse::<f64>() {
+        let limit_price = if matches!(self.account.order_type, OrderType::Limit) {
+            match self.account.order_limit_price.parse::<f64>() {
                 Ok(p) if p > 0.0 => Some(p),
                 _ => {
-                    self.order_message = Some("Error: Invalid limit price".to_string());
+                    self.account.order_message = Some("Error: Invalid limit price".to_string());
                     cx.notify();
                     return;
                 }
@@ -326,21 +264,21 @@ impl TradingTerminal {
             None
         };
 
-        self.order_submitting = true;
-        self.order_message = None;
+        self.account.order_submitting = true;
+        self.account.order_message = None;
         cx.notify();
 
         let symbol = self.chart.symbol.clone();
-        let side = match self.order_side {
+        let side = match self.account.order_side {
             OrderSide::Buy => OrderSide::Buy,
             OrderSide::Sell => OrderSide::Sell,
         };
-        let order_type = match self.order_type {
+        let order_type = match self.account.order_type {
             OrderType::Market => OrderType::Market,
             OrderType::Limit => OrderType::Limit,
             _ => OrderType::Market,
         };
-        let time_in_force = match self.order_time_in_force {
+        let time_in_force = match self.account.order_time_in_force {
             OrderTimeInForce::Day => OrderTimeInForce::Day,
             OrderTimeInForce::Gtc => OrderTimeInForce::Gtc,
             _ => OrderTimeInForce::Day,
@@ -350,24 +288,31 @@ impl TradingTerminal {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    submit_order_sync(symbol, side, order_type, qty, limit_price, time_in_force)
+                    account::submit_order_sync(
+                        symbol,
+                        side,
+                        order_type,
+                        qty,
+                        limit_price,
+                        time_in_force,
+                    )
                 })
                 .await;
 
-            let _ = this.update(cx, |chart, cx| {
+            let _ = this.update(cx, |terminal, cx| {
                 match result {
                     Ok(order_id) => {
-                        chart.order_message =
+                        terminal.account.order_message =
                             Some(format!("✓ Order submitted successfully! ID: {}", order_id));
-                        chart.order_quantity = "".to_string();
-                        chart.order_limit_price = "".to_string();
+                        terminal.account.order_quantity = "".to_string();
+                        terminal.account.order_limit_price = "".to_string();
                         // WebSocket will handle the order update automatically
                     }
                     Err(error) => {
-                        chart.order_message = Some(format!("✗ Error: {}", error));
+                        terminal.account.order_message = Some(format!("✗ Error: {}", error));
                     }
                 }
-                chart.order_submitting = false;
+                terminal.account.order_submitting = false;
                 cx.notify();
             });
         })
@@ -413,12 +358,12 @@ impl TradingTerminal {
             }
             StreamUpdate::TradeUpdate(order_update) => {
                 println!("📦 Received order update for: {}", order_update.symbol);
-                self.update_order_from_stream(order_update);
+                self.account.update_order_from_stream(order_update);
                 cx.notify();
             }
             StreamUpdate::AccountUpdate(account_info) => {
                 println!("💰 Received account update");
-                self.update_account_from_stream(account_info);
+                self.account.update_from_stream(account_info);
                 cx.notify();
             }
             StreamUpdate::Error(error) => {
@@ -442,80 +387,6 @@ impl TradingTerminal {
                 cx.notify();
             }
         }
-    }
-
-    fn update_order_from_stream(&mut self, order_update: stream::OrderUpdate) {
-        // Check if this is a terminal state - remove from list immediately
-        let is_terminal_state = matches!(
-            order_update.status.as_str(),
-            "filled" | "canceled" | "expired" | "rejected"
-        );
-
-        if is_terminal_state {
-            // Remove the order from the list
-            if let Some(pos) = self.orders.iter().position(|o| o.id == order_update.id) {
-                self.orders.remove(pos);
-                println!(
-                    "🗑️  Removed {} order {} from list",
-                    order_update.status, order_update.id
-                );
-            } else {
-                println!(
-                    "ℹ️  Order {} is {} but not found in list",
-                    order_update.id, order_update.status
-                );
-            }
-            return;
-        }
-
-        // Find and update existing order, or add new one
-        if let Some(existing_order) = self.orders.iter_mut().find(|o| o.id == order_update.id) {
-            // Update existing order
-            existing_order.symbol = order_update.symbol.clone();
-            existing_order.side = order_update.side.clone();
-            existing_order.qty = order_update.qty.clone();
-            existing_order.order_type = order_update.order_type.clone();
-            existing_order.limit_price = order_update.limit_price.clone();
-            existing_order.status = order_update.status.clone();
-            existing_order.created_at = order_update.created_at.clone();
-
-            println!(
-                "✓ Updated order {} - Status: {}",
-                existing_order.id, existing_order.status
-            );
-        } else {
-            // Add new order (only if not terminal state)
-            let new_order = Order {
-                id: order_update.id.clone(),
-                symbol: order_update.symbol.clone(),
-                side: order_update.side.clone(),
-                qty: order_update.qty.clone(),
-                order_type: order_update.order_type.clone(),
-                limit_price: order_update.limit_price.clone(),
-                status: order_update.status.clone(),
-                created_at: order_update.created_at.clone(),
-            };
-
-            println!("✓ Added new order {}", new_order.id);
-            self.orders.push(new_order);
-        }
-    }
-
-    fn update_account_from_stream(&mut self, account_info: stream::AccountInfo) {
-        // Parse and update account information
-        if let Ok(buying_power) = account_info.buying_power.parse::<f64>() {
-            self.buying_power = Some(buying_power);
-        }
-
-        if let Ok(cash) = account_info.cash.parse::<f64>() {
-            self.cash = Some(cash);
-        }
-
-        if let Ok(portfolio_value) = account_info.portfolio_value.parse::<f64>() {
-            self.portfolio_value = Some(portfolio_value);
-        }
-
-        println!("✓ Account updated from stream");
     }
 
     fn start_market_data_stream(&mut self, cx: &mut Context<Self>) {
@@ -1372,23 +1243,23 @@ impl Render for TradingTerminal {
                         }
 
                         // Handle quantity input
-                        if this.quantity_focused {
+                        if this.account.quantity_focused {
                             let key = event.keystroke.key.as_str();
 
                             if key == "enter" {
-                                this.quantity_focused = false;
+                                this.account.quantity_focused = false;
                                 cx.notify();
                             } else if key == "backspace" {
-                                this.order_quantity.pop();
+                                this.account.order_quantity.pop();
                                 cx.notify();
                             } else if key == "escape" {
-                                this.quantity_focused = false;
+                                this.account.quantity_focused = false;
                                 cx.notify();
                             } else if let Some(key_char) = &event.keystroke.key_char {
                                 if key_char.len() == 1
                                     && (key_char.chars().all(|c| c.is_numeric()) || key_char == ".")
                                 {
-                                    this.order_quantity.push_str(key_char);
+                                    this.account.order_quantity.push_str(key_char);
                                     cx.notify();
                                 }
                             }
@@ -1396,23 +1267,23 @@ impl Render for TradingTerminal {
                         }
 
                         // Handle price input
-                        if this.price_focused {
+                        if this.account.price_focused {
                             let key = event.keystroke.key.as_str();
 
                             if key == "enter" {
-                                this.price_focused = false;
+                                this.account.price_focused = false;
                                 cx.notify();
                             } else if key == "backspace" {
-                                this.order_limit_price.pop();
+                                this.account.order_limit_price.pop();
                                 cx.notify();
                             } else if key == "escape" {
-                                this.price_focused = false;
+                                this.account.price_focused = false;
                                 cx.notify();
                             } else if let Some(key_char) = &event.keystroke.key_char {
                                 if key_char.len() == 1
                                     && (key_char.chars().all(|c| c.is_numeric()) || key_char == ".")
                                 {
-                                    this.order_limit_price.push_str(key_char);
+                                    this.account.order_limit_price.push_str(key_char);
                                     cx.notify();
                                 }
                             }
@@ -1625,8 +1496,8 @@ impl Render for TradingTerminal {
                                                         |this, _, _window, cx| {
                                                             this.chart.bar_limit_focused = true;
                                                             this.chart.input_focused = false;
-                                                            this.quantity_focused = false;
-                                                            this.price_focused = false;
+                                                            this.account.quantity_focused = false;
+                                                            this.account.price_focused = false;
                                                             _window.focus(&this.focus_handle);
                                                             cx.notify();
                                                         },
@@ -1865,8 +1736,8 @@ impl Render for TradingTerminal {
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .cursor_pointer()
                                                     .bg(
-                                                        if self.active_footer_tab
-                                                            == FooterTab::Account
+                                                        if self.account.active_footer_tab
+                                                            == account::FooterTab::Account
                                                         {
                                                             rgb(0x238636)
                                                         } else {
@@ -1875,8 +1746,8 @@ impl Render for TradingTerminal {
                                                     )
                                                     .text_color(rgb(0xffffff))
                                                     .hover(|style| {
-                                                        if self.active_footer_tab
-                                                            == FooterTab::Account
+                                                        if self.account.active_footer_tab
+                                                            == account::FooterTab::Account
                                                         {
                                                             style.bg(rgb(0x2ea043))
                                                         } else {
@@ -1885,7 +1756,7 @@ impl Render for TradingTerminal {
                                                     })
                                                     .child("Account Information")
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.active_footer_tab = FooterTab::Account;
+                                                        this.account.active_footer_tab = account::FooterTab::Account;
                                                         cx.notify();
                                                     })),
                                             )
@@ -1899,8 +1770,8 @@ impl Render for TradingTerminal {
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .cursor_pointer()
                                                     .bg(
-                                                        if self.active_footer_tab
-                                                            == FooterTab::Positions
+                                                        if self.account.active_footer_tab
+                                                            == account::FooterTab::Positions
                                                         {
                                                             rgb(0x238636)
                                                         } else {
@@ -1909,8 +1780,8 @@ impl Render for TradingTerminal {
                                                     )
                                                     .text_color(rgb(0xffffff))
                                                     .hover(|style| {
-                                                        if self.active_footer_tab
-                                                            == FooterTab::Positions
+                                                        if self.account.active_footer_tab
+                                                            == account::FooterTab::Positions
                                                         {
                                                             style.bg(rgb(0x2ea043))
                                                         } else {
@@ -1919,8 +1790,8 @@ impl Render for TradingTerminal {
                                                     })
                                                     .child("Active Positions")
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.active_footer_tab =
-                                                            FooterTab::Positions;
+                                                        this.account.active_footer_tab =
+                                                            account::FooterTab::Positions;
                                                         cx.notify();
                                                     })),
                                             )
@@ -1934,8 +1805,8 @@ impl Render for TradingTerminal {
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .cursor_pointer()
                                                     .bg(
-                                                        if self.active_footer_tab
-                                                            == FooterTab::Orders
+                                                        if self.account.active_footer_tab
+                                                            == account::FooterTab::Orders
                                                         {
                                                             rgb(0x238636)
                                                         } else {
@@ -1944,8 +1815,8 @@ impl Render for TradingTerminal {
                                                     )
                                                     .text_color(rgb(0xffffff))
                                                     .hover(|style| {
-                                                        if self.active_footer_tab
-                                                            == FooterTab::Orders
+                                                        if self.account.active_footer_tab
+                                                            == account::FooterTab::Orders
                                                         {
                                                             style.bg(rgb(0x2ea043))
                                                         } else {
@@ -1954,7 +1825,7 @@ impl Render for TradingTerminal {
                                                     })
                                                     .child("Active Orders")
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.active_footer_tab = FooterTab::Orders;
+                                                        this.account.active_footer_tab = account::FooterTab::Orders;
                                                         cx.notify();
                                                     })),
                                             ),
@@ -1972,13 +1843,13 @@ impl Render for TradingTerminal {
                                             .cursor_pointer()
                                             .hover(|style| style.bg(rgb(0x2ea043)))
                                             .child(
-                                                if (self.active_footer_tab == FooterTab::Account
-                                                    && self.account_loading)
-                                                    || (self.active_footer_tab
-                                                        == FooterTab::Positions
-                                                        && self.positions_loading)
-                                                    || (self.active_footer_tab == FooterTab::Orders
-                                                        && self.orders_loading)
+                                                if (self.account.active_footer_tab == account::FooterTab::Account
+                                                    && self.account.account_loading)
+                                                    || (self.account.active_footer_tab
+                                                        == account::FooterTab::Positions
+                                                        && self.account.positions_loading)
+                                                    || (self.account.active_footer_tab == account::FooterTab::Orders
+                                                        && self.account.orders_loading)
                                                 {
                                                     "⟳ Loading..."
                                                 } else {
@@ -1986,23 +1857,23 @@ impl Render for TradingTerminal {
                                                 },
                                             )
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                match this.active_footer_tab {
-                                                    FooterTab::Account => this.fetch_account(cx),
-                                                    FooterTab::Positions => {
+                                                match this.account.active_footer_tab {
+                                                    account::FooterTab::Account => this.fetch_account(cx),
+                                                    account::FooterTab::Positions => {
                                                         this.fetch_positions(cx)
                                                     }
-                                                    FooterTab::Orders => this.fetch_orders(cx),
+                                                    account::FooterTab::Orders => this.fetch_orders(cx),
                                                 }
                                             })),
                                     ),
                             )
-                            .when(self.active_footer_tab == FooterTab::Account, |div| {
+                            .when(self.account.active_footer_tab == account::FooterTab::Account, |div| {
                                 div.child(self.render_account_tab())
                             })
-                            .when(self.active_footer_tab == FooterTab::Positions, |div| {
+                            .when(self.account.active_footer_tab == account::FooterTab::Positions, |div| {
                                 div.child(self.render_positions_tab(cx))
                             })
-                            .when(self.active_footer_tab == FooterTab::Orders, |div| {
+                            .when(self.account.active_footer_tab == account::FooterTab::Orders, |div| {
                                 div.child(self.render_orders_tab(cx))
                             }),
                     ),
@@ -2075,7 +1946,7 @@ impl Render for TradingTerminal {
                                     .gap_2()
                                     .child(
                                         div()
-                                            .id("order-side-buy")
+                                            .id("order-side-buy-btn")
                                             .flex_1()
                                             .px_3()
                                             .py_2()
@@ -2083,28 +1954,28 @@ impl Render for TradingTerminal {
                                             .text_center()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .cursor_pointer()
-                                            .bg(if matches!(self.order_side, OrderSide::Buy) {
-                                                rgb(0x238636)
+                                            .bg(if matches!(self.account.order_side, OrderSide::Buy) {
+                                                rgb(0x3fb950)
                                             } else {
                                                 rgb(0x21262d)
                                             })
                                             .text_color(rgb(0xffffff))
                                             .hover(|style| {
-                                                if matches!(self.order_side, OrderSide::Buy) {
-                                                    style.bg(rgb(0x2ea043))
+                                                if matches!(self.account.order_side, OrderSide::Buy) {
+                                                    style.bg(rgb(0x4fc55d))
                                                 } else {
                                                     style.bg(rgb(0x30363d))
                                                 }
                                             })
                                             .child("Buy")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.order_side = OrderSide::Buy;
+                                                this.account.order_side = OrderSide::Buy;
                                                 cx.notify();
                                             })),
                                     )
                                     .child(
                                         div()
-                                            .id("order-side-sell")
+                                            .id("order-side-sell-btn")
                                             .flex_1()
                                             .px_3()
                                             .py_2()
@@ -2112,22 +1983,22 @@ impl Render for TradingTerminal {
                                             .text_center()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .cursor_pointer()
-                                            .bg(if matches!(self.order_side, OrderSide::Sell) {
-                                                rgb(0xda3633)
+                                            .bg(if matches!(self.account.order_side, OrderSide::Sell) {
+                                                rgb(0xff4444)
                                             } else {
                                                 rgb(0x21262d)
                                             })
                                             .text_color(rgb(0xffffff))
                                             .hover(|style| {
-                                                if matches!(self.order_side, OrderSide::Sell) {
-                                                    style.bg(rgb(0xff4444))
+                                                if matches!(self.account.order_side, OrderSide::Sell) {
+                                                    style.bg(rgb(0xff5555))
                                                 } else {
                                                     style.bg(rgb(0x30363d))
                                                 }
                                             })
                                             .child("Sell")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.order_side = OrderSide::Sell;
+                                                this.account.order_side = OrderSide::Sell;
                                                 cx.notify();
                                             })),
                                     ),
@@ -2152,7 +2023,7 @@ impl Render for TradingTerminal {
                                     .gap_2()
                                     .child(
                                         div()
-                                            .id("order-type-market")
+                                            .id("order-type-market-btn")
                                             .flex_1()
                                             .px_3()
                                             .py_2()
@@ -2160,14 +2031,14 @@ impl Render for TradingTerminal {
                                             .text_center()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .cursor_pointer()
-                                            .bg(if matches!(self.order_type, OrderType::Market) {
+                                            .bg(if matches!(self.account.order_type, OrderType::Market) {
                                                 rgb(0x1f6feb)
                                             } else {
                                                 rgb(0x21262d)
                                             })
                                             .text_color(rgb(0xffffff))
                                             .hover(|style| {
-                                                if matches!(self.order_type, OrderType::Market) {
+                                                if matches!(self.account.order_type, OrderType::Market) {
                                                     style.bg(rgb(0x388bfd))
                                                 } else {
                                                     style.bg(rgb(0x30363d))
@@ -2175,13 +2046,13 @@ impl Render for TradingTerminal {
                                             })
                                             .child("Market")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.order_type = OrderType::Market;
+                                                this.account.order_type = OrderType::Market;
                                                 cx.notify();
                                             })),
                                     )
                                     .child(
                                         div()
-                                            .id("order-type-limit")
+                                            .id("order-type-limit-btn")
                                             .flex_1()
                                             .px_3()
                                             .py_2()
@@ -2189,14 +2060,14 @@ impl Render for TradingTerminal {
                                             .text_center()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .cursor_pointer()
-                                            .bg(if matches!(self.order_type, OrderType::Limit) {
+                                            .bg(if matches!(self.account.order_type, OrderType::Limit) {
                                                 rgb(0x1f6feb)
                                             } else {
                                                 rgb(0x21262d)
                                             })
                                             .text_color(rgb(0xffffff))
                                             .hover(|style| {
-                                                if matches!(self.order_type, OrderType::Limit) {
+                                                if matches!(self.account.order_type, OrderType::Limit) {
                                                     style.bg(rgb(0x388bfd))
                                                 } else {
                                                     style.bg(rgb(0x30363d))
@@ -2204,7 +2075,7 @@ impl Render for TradingTerminal {
                                             })
                                             .child("Limit")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.order_type = OrderType::Limit;
+                                                this.account.order_type = OrderType::Limit;
                                                 cx.notify();
                                             })),
                                     ),
@@ -2228,13 +2099,13 @@ impl Render for TradingTerminal {
                                     .id("order-quantity-input")
                                     .px_3()
                                     .py_2()
-                                    .bg(if self.quantity_focused {
+                                    .bg(if self.account.quantity_focused {
                                         rgb(0x1f2937)
                                     } else {
                                         rgb(0x0d1117)
                                     })
                                     .border_1()
-                                    .border_color(if self.quantity_focused {
+                                    .border_color(if self.account.quantity_focused {
                                         rgb(0x1f6feb)
                                     } else {
                                         rgb(0x30363d)
@@ -2242,17 +2113,17 @@ impl Render for TradingTerminal {
                                     .rounded_md()
                                     .text_color(rgb(0xffffff))
                                     .cursor_text()
-                                    .child(if self.quantity_focused {
-                                        format!("{}|", self.order_quantity)
-                                    } else if self.order_quantity.is_empty() {
+                                    .child(if self.account.quantity_focused {
+                                        format!("{}|", self.account.order_quantity)
+                                    } else if self.account.order_quantity.is_empty() {
                                         "Enter quantity...".to_string()
                                     } else {
-                                        self.order_quantity.clone()
+                                        self.account.order_quantity.clone()
                                     })
                                     .on_click(cx.listener(|this, _, _window, cx| {
-                                        this.quantity_focused = true;
+                                        this.account.quantity_focused = true;
                                         this.chart.input_focused = false;
-                                        this.price_focused = false;
+                                        this.account.price_focused = false;
                                         _window.focus(&this.focus_handle);
                                         cx.notify();
                                     })),
@@ -2273,7 +2144,7 @@ impl Render for TradingTerminal {
                             .px_4()
                             .py_3()
                             .mt_4()
-                            .bg(if matches!(self.order_side, OrderSide::Buy) {
+                            .bg(if matches!(self.account.order_side, OrderSide::Buy) {
                                 rgb(0x238636)
                             } else {
                                 rgb(0xda3633)
@@ -2284,18 +2155,18 @@ impl Render for TradingTerminal {
                             .font_weight(FontWeight::BOLD)
                             .cursor_pointer()
                             .hover(|style| {
-                                if matches!(self.order_side, OrderSide::Buy) {
+                                if matches!(self.account.order_side, OrderSide::Buy) {
                                     style.bg(rgb(0x2ea043))
                                 } else {
                                     style.bg(rgb(0xff4444))
                                 }
                             })
-                            .child(if self.order_submitting {
+                            .child(if self.account.order_submitting {
                                 "Submitting...".to_string()
                             } else {
                                 format!(
                                     "{} {}",
-                                    if matches!(self.order_side, OrderSide::Buy) {
+                                    if matches!(self.account.order_side, OrderSide::Buy) {
                                         "Buy"
                                     } else {
                                         "Sell"
@@ -2304,7 +2175,7 @@ impl Render for TradingTerminal {
                                 )
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if !this.order_submitting {
+                                if !this.account.order_submitting {
                                     this.submit_order(cx);
                                 }
                             })),
@@ -2323,7 +2194,8 @@ impl TradingTerminal {
             .child(
                 self.render_account_stat(
                     "Account Number".to_string(),
-                    self.account_number
+                    self.account
+                        .account_number
                         .clone()
                         .unwrap_or("Loading...".to_string()),
                     rgb(0xa371f7),
@@ -2332,7 +2204,8 @@ impl TradingTerminal {
             .child(
                 self.render_account_stat(
                     "Account Status".to_string(),
-                    self.account_status
+                    self.account
+                        .account_status
                         .clone()
                         .unwrap_or("Loading...".to_string()),
                     rgb(0x58a6ff),
@@ -2340,28 +2213,28 @@ impl TradingTerminal {
             )
             .child(self.render_account_stat(
                 "Portfolio Value".to_string(),
-                format!("${:.2}", self.portfolio_value.unwrap_or(0.0)),
+                format!("${:.2}", self.account.portfolio_value.unwrap_or(0.0)),
                 rgb(0x3fb950),
             ))
             .child(self.render_account_stat(
                 "Equity".to_string(),
-                format!("${:.2}", self.equity.unwrap_or(0.0)),
+                format!("${:.2}", self.account.equity.unwrap_or(0.0)),
                 rgb(0x3fb950),
             ))
             .child(self.render_account_stat(
                 "Cash".to_string(),
-                format!("${:.2}", self.cash.unwrap_or(0.0)),
+                format!("${:.2}", self.account.cash.unwrap_or(0.0)),
                 rgb(0xf2cc60),
             ))
             .child(self.render_account_stat(
                 "Buying Power".to_string(),
-                format!("${:.2}", self.buying_power.unwrap_or(0.0)),
+                format!("${:.2}", self.account.buying_power.unwrap_or(0.0)),
                 rgb(0xf2cc60),
             ))
     }
 
     fn render_positions_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.positions_loading {
+        if self.account.positions_loading {
             return div()
                 .grid()
                 .items_center()
@@ -2371,7 +2244,7 @@ impl TradingTerminal {
                 .child("Loading positions...");
         }
 
-        if self.positions.is_empty() {
+        if self.account.positions.is_empty() {
             return div()
                 .grid()
                 .items_center()
@@ -2458,7 +2331,7 @@ impl TradingTerminal {
                             .child("Action"),
                     ),
             )
-            .children(self.positions.iter().enumerate().map(|(idx, pos)| {
+            .children(self.account.positions.iter().enumerate().map(|(idx, pos)| {
                 let pl_value = pos.unrealized_pl.parse::<f64>().unwrap_or(0.0);
                 let pl_color = if pl_value > 0.0 {
                     rgb(0x3fb950)
@@ -2549,7 +2422,7 @@ impl TradingTerminal {
     }
 
     fn render_orders_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.orders_loading {
+        if self.account.orders_loading {
             return div()
                 .grid()
                 .items_center()
@@ -2559,7 +2432,7 @@ impl TradingTerminal {
                 .child("Loading orders...");
         }
 
-        if self.orders.is_empty() {
+        if self.account.orders.is_empty() {
             return div()
                 .grid()
                 .items_center()
@@ -2646,7 +2519,7 @@ impl TradingTerminal {
                             .child("Action"),
                     ),
             )
-            .children(self.orders.iter().enumerate().map(|(idx, order)| {
+            .children(self.account.orders.iter().enumerate().map(|(idx, order)| {
                 let side_color = if order.side.to_lowercase().contains("buy") {
                     rgb(0x3fb950)
                 } else {
@@ -2741,7 +2614,7 @@ impl TradingTerminal {
     }
 
     fn render_limit_price_input(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if !matches!(self.order_type, OrderType::Limit) {
+        if !matches!(self.account.order_type, OrderType::Limit) {
             return div();
         }
 
@@ -2761,13 +2634,13 @@ impl TradingTerminal {
                     .id("order-limit-price-input")
                     .px_3()
                     .py_2()
-                    .bg(if self.price_focused {
+                    .bg(if self.account.price_focused {
                         rgb(0x1f2937)
                     } else {
                         rgb(0x0d1117)
                     })
                     .border_1()
-                    .border_color(if self.price_focused {
+                    .border_color(if self.account.price_focused {
                         rgb(0x1f6feb)
                     } else {
                         rgb(0x30363d)
@@ -2775,17 +2648,17 @@ impl TradingTerminal {
                     .rounded_md()
                     .text_color(rgb(0xffffff))
                     .cursor_text()
-                    .child(if self.price_focused {
-                        format!("{}|", self.order_limit_price)
-                    } else if self.order_limit_price.is_empty() {
+                    .child(if self.account.price_focused {
+                        format!("{}|", self.account.order_limit_price)
+                    } else if self.account.order_limit_price.is_empty() {
                         "Enter price...".to_string()
                     } else {
-                        format!("${}", self.order_limit_price)
+                        format!("${}", self.account.order_limit_price)
                     })
                     .on_click(cx.listener(|this, _, _window, cx| {
-                        this.price_focused = true;
+                        this.account.price_focused = true;
                         this.chart.input_focused = false;
-                        this.quantity_focused = false;
+                        this.account.quantity_focused = false;
                         _window.focus(&this.focus_handle);
                         cx.notify();
                     })),
@@ -2793,7 +2666,7 @@ impl TradingTerminal {
     }
 
     fn render_time_in_force(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if !matches!(self.order_type, OrderType::Limit) {
+        if !matches!(self.account.order_type, OrderType::Limit) {
             return div();
         }
 
@@ -2823,7 +2696,8 @@ impl TradingTerminal {
                             .font_weight(FontWeight::SEMIBOLD)
                             .cursor_pointer()
                             .bg(
-                                if matches!(self.order_time_in_force, OrderTimeInForce::Day) {
+                                if matches!(self.account.order_time_in_force, OrderTimeInForce::Day)
+                                {
                                     rgb(0x1f6feb)
                                 } else {
                                     rgb(0x21262d)
@@ -2831,7 +2705,8 @@ impl TradingTerminal {
                             )
                             .text_color(rgb(0xffffff))
                             .hover(|style| {
-                                if matches!(self.order_time_in_force, OrderTimeInForce::Day) {
+                                if matches!(self.account.order_time_in_force, OrderTimeInForce::Day)
+                                {
                                     style.bg(rgb(0x388bfd))
                                 } else {
                                     style.bg(rgb(0x30363d))
@@ -2839,7 +2714,7 @@ impl TradingTerminal {
                             })
                             .child("Day")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.order_time_in_force = OrderTimeInForce::Day;
+                                this.account.order_time_in_force = OrderTimeInForce::Day;
                                 cx.notify();
                             })),
                     )
@@ -2854,7 +2729,8 @@ impl TradingTerminal {
                             .font_weight(FontWeight::SEMIBOLD)
                             .cursor_pointer()
                             .bg(
-                                if matches!(self.order_time_in_force, OrderTimeInForce::Gtc) {
+                                if matches!(self.account.order_time_in_force, OrderTimeInForce::Gtc)
+                                {
                                     rgb(0x1f6feb)
                                 } else {
                                     rgb(0x21262d)
@@ -2862,7 +2738,8 @@ impl TradingTerminal {
                             )
                             .text_color(rgb(0xffffff))
                             .hover(|style| {
-                                if matches!(self.order_time_in_force, OrderTimeInForce::Gtc) {
+                                if matches!(self.account.order_time_in_force, OrderTimeInForce::Gtc)
+                                {
                                     style.bg(rgb(0x388bfd))
                                 } else {
                                     style.bg(rgb(0x30363d))
@@ -2870,7 +2747,7 @@ impl TradingTerminal {
                             })
                             .child("GTC")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.order_time_in_force = OrderTimeInForce::Gtc;
+                                this.account.order_time_in_force = OrderTimeInForce::Gtc;
                                 cx.notify();
                             })),
                     ),
@@ -2878,7 +2755,7 @@ impl TradingTerminal {
     }
 
     fn render_order_message(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        if self.order_message.is_none() {
+        if self.account.order_message.is_none() {
             return div();
         }
 
@@ -2890,12 +2767,20 @@ impl TradingTerminal {
             .border_color(rgb(0x30363d))
             .rounded_md()
             .text_xs()
-            .text_color(if self.order_message.as_ref().unwrap().starts_with("✓") {
-                rgb(0x3fb950)
-            } else {
-                rgb(0xff4444)
-            })
-            .child(self.order_message.clone().unwrap())
+            .text_color(
+                if self
+                    .account
+                    .order_message
+                    .as_ref()
+                    .unwrap()
+                    .starts_with("✓")
+                {
+                    rgb(0x3fb950)
+                } else {
+                    rgb(0xff4444)
+                },
+            )
+            .child(self.account.order_message.clone().unwrap())
     }
 
     fn render_account_stat(
@@ -2977,232 +2862,6 @@ impl TradingTerminal {
 }
 
 // Synchronous function to fetch account info (runs in background thread)
-fn fetch_account_sync() -> Result<(String, String, f64, f64, f64, f64), String> {
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
-
-    rt.block_on(async {
-        let config = match AlpacaConfig::from_env() {
-            Ok(config) => config,
-            Err(e) => {
-                return Err(format!(
-                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
-                    e
-                ));
-            }
-        };
-
-        let client = TradingClient::new(config);
-
-        let result = client.get_account().await;
-
-        match result {
-            Ok(account) => {
-                // Parse string values to f64
-                let buying_power = account.buying_power.parse::<f64>().unwrap_or(0.0);
-                let cash = account.cash.parse::<f64>().unwrap_or(0.0);
-                let portfolio_value = account.portfolio_value.parse::<f64>().unwrap_or(0.0);
-                let equity = account.equity.parse::<f64>().unwrap_or(0.0);
-
-                Ok((
-                    account.account_number,
-                    format!("{:?}", account.status),
-                    buying_power,
-                    cash,
-                    portfolio_value,
-                    equity,
-                ))
-            },
-            Err(e) => Err(format!("Error fetching account: {:?}", e)),
-        }
-    })
-}
-
-// Synchronous function to fetch positions (runs in background thread)
-fn fetch_positions_sync() -> Result<Vec<Position>, String> {
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
-
-    rt.block_on(async {
-        let config = match AlpacaConfig::from_env() {
-            Ok(config) => config,
-            Err(e) => {
-                return Err(format!(
-                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
-                    e
-                ));
-            }
-        };
-
-        let client = TradingClient::new(config);
-
-        let result = client.get_positions().await;
-
-        match result {
-            Ok(positions) => {
-                let mapped_positions = positions
-                    .into_iter()
-                    .map(|p| Position {
-                        symbol: p.symbol,
-                        qty: p.qty,
-                        avg_entry_price: p.avg_entry_price,
-                        current_price: p.current_price,
-                        market_value: p.market_value,
-                        unrealized_pl: p.unrealized_pl,
-                        unrealized_plpc: p.unrealized_plpc,
-                    })
-                    .collect();
-                Ok(mapped_positions)
-            }
-            Err(e) => Err(format!("Error fetching positions: {:?}", e)),
-        }
-    })
-}
-
-// Synchronous function to fetch orders (runs in background thread)
-fn fetch_orders_sync() -> Result<Vec<Order>, String> {
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
-
-    rt.block_on(async {
-        let config = match AlpacaConfig::from_env() {
-            Ok(config) => config,
-            Err(e) => {
-                return Err(format!(
-                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
-                    e
-                ));
-            }
-        };
-
-        let client = TradingClient::new(config);
-
-        // Get open orders (status="open")
-        let result = client.get_orders(Some("open"), Some(50)).await;
-
-        match result {
-            Ok(orders) => {
-                let mapped_orders = orders
-                    .into_iter()
-                    .map(|o| Order {
-                        id: o.id,
-                        symbol: o.symbol,
-                        side: format!("{:?}", o.side),
-                        qty: o.qty.unwrap_or("0".to_string()),
-                        order_type: format!("{:?}", o.order_type),
-                        limit_price: o.limit_price,
-                        status: format!("{:?}", o.status),
-                        created_at: o.created_at.format("%Y-%m-%d %H:%M").to_string(),
-                    })
-                    .collect();
-                Ok(mapped_orders)
-            }
-            Err(e) => Err(format!("Error fetching orders: {:?}", e)),
-        }
-    })
-}
-
-// Synchronous function to submit an order (runs in background thread)
-fn submit_order_sync(
-    symbol: String,
-    side: OrderSide,
-    order_type: OrderType,
-    qty: f64,
-    limit_price: Option<f64>,
-    time_in_force: OrderTimeInForce,
-) -> Result<String, String> {
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
-
-    rt.block_on(async {
-        let config = match AlpacaConfig::from_env() {
-            Ok(config) => config,
-            Err(e) => {
-                return Err(format!(
-                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
-                    e
-                ));
-            }
-        };
-
-        let client = TradingClient::new(config);
-
-        use alpaca_markets::models::OrderRequest;
-
-        let order_request = OrderRequest {
-            symbol: symbol.clone(),
-            qty: Some(qty.to_string()),
-            notional: None,
-            side,
-            order_type,
-            time_in_force,
-            limit_price: limit_price.map(|p| p.to_string()),
-            stop_price: None,
-            extended_hours: Some(false),
-            client_order_id: None,
-            order_class: None,
-            take_profit: None,
-            stop_loss: None,
-            trail_price: None,
-            trail_percent: None,
-        };
-
-        let result = client.submit_order(order_request).await;
-
-        match result {
-            Ok(order) => Ok(order.id),
-            Err(e) => Err(format!("Failed to submit order: {:?}", e)),
-        }
-    })
-}
-
-// Synchronous function to cancel an order (runs in background thread)
-fn cancel_order_sync(order_id: String) -> Result<(), String> {
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
-
-    rt.block_on(async {
-        let config = match AlpacaConfig::from_env() {
-            Ok(config) => config,
-            Err(e) => {
-                return Err(format!(
-                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
-                    e
-                ));
-            }
-        };
-
-        let client = TradingClient::new(config);
-
-        let result = client.cancel_order(&order_id).await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("Failed to cancel order: {:?}", e)),
-        }
-    })
-}
-
-// Synchronous function to close a position (runs in background thread)
-fn close_position_sync(symbol: String) -> Result<(), String> {
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Runtime error: {:?}", e))?;
-
-    rt.block_on(async {
-        let config = match AlpacaConfig::from_env() {
-            Ok(config) => config,
-            Err(e) => {
-                return Err(format!(
-                    "Error loading config: {:?}. Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables.",
-                    e
-                ));
-            }
-        };
-
-        let client = TradingClient::new(config);
-
-        let result = client.close_position(&symbol, None, None).await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("Failed to close position: {:?}", e)),
-        }
-    })
-}
 
 // Synchronous function to fetch bars (runs in background thread)
 // Uses split-adjusted data with sort=desc to get most recent bars
