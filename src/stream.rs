@@ -30,6 +30,7 @@ pub struct OrderUpdate {
     pub limit_price: Option<String>,
     pub status: String,
     pub created_at: String,
+    #[allow(dead_code)]
     pub event: String,
 }
 
@@ -55,34 +56,10 @@ pub struct BarUpdate {
     pub vwap: Option<String>,
 }
 
-/// WebSocket stream manager
-pub struct StreamManager {
-    sender: mpsc::UnboundedSender<StreamUpdate>,
-    receiver: mpsc::UnboundedReceiver<StreamUpdate>,
-}
+/// WebSocket stream manager - provides methods for managing trading streams
+pub struct StreamManager;
 
 impl StreamManager {
-    /// Create a new stream manager
-    pub fn new() -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        Self { sender, receiver }
-    }
-
-    /// Get a sender handle for spawning the WebSocket task
-    pub fn get_sender(&self) -> mpsc::UnboundedSender<StreamUpdate> {
-        self.sender.clone()
-    }
-
-    /// Take the receiver (can only be done once)
-    pub fn take_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<StreamUpdate>> {
-        // We need to return a new receiver, but we can't clone mpsc receivers
-        // So we'll create a new channel pair and swap
-        let (new_sender, new_receiver) = mpsc::unbounded_channel();
-        let old_receiver = std::mem::replace(&mut self.receiver, new_receiver);
-        self.sender = new_sender;
-        Some(old_receiver)
-    }
-
     /// Start the WebSocket connection in a background task
     pub fn start_stream(sender: mpsc::UnboundedSender<StreamUpdate>) -> thread::JoinHandle<()> {
         thread::spawn(move || {
@@ -263,16 +240,10 @@ fn convert_trade_update(trade: TradeUpdate) -> OrderUpdate {
 }
 
 /// Market Data Stream Manager
-pub struct MarketDataStreamManager {
-    sender: mpsc::UnboundedSender<StreamUpdate>,
-}
+/// Market data stream manager - provides methods for managing market data streams
+pub struct MarketDataStreamManager;
 
 impl MarketDataStreamManager {
-    /// Create a new market data stream manager
-    pub fn new(sender: mpsc::UnboundedSender<StreamUpdate>) -> Self {
-        Self { sender }
-    }
-
     /// Start the market data WebSocket connection in a background task
     pub fn start_stream(
         sender: mpsc::UnboundedSender<StreamUpdate>,
